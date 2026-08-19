@@ -21,7 +21,9 @@ data/*.sqlite3.tmp
 data/2026JCRJournals.xlsx
 
 # Third-party reference documents (not redistributed)
-docs/qualityevaldocs/
+docs/
+mermaid流程图/
+
 
 # Test caches
 .pytest_cache/
