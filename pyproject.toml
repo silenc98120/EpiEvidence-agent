@@ -1,0 +1,27 @@
+[project]
+name = "epi-research-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "dotenv>=0.9.9",
+    "httpx>=0.28.1",
+    "langchain>=1.3.14",
+    "langchain-ollama>=1.1.0",
+    "langchain-openai>=1.4.1",
+    "langgraph>=1.2.9",
+    "loguru>=0.7.3",
+    "pydantic>=2.13.4",
+    "psycopg[binary]>=3.2",
+    "redis>=5.2",
+    "sqlalchemy>=2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

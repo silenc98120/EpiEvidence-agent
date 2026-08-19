@@ -4,7 +4,26 @@
 
 本设计将 EpiEvidence 从 PubMed、Europe PMC 双来源检索扩展为可控的多源检索流程。第一版新增 Semantic Scholar、PMC、bioRxiv 和 medRxiv，同时保留数据来源追踪信息，并统一转换为与具体平台无关的数据契约。
 
-当前 MVP 仍然根据题录和摘要推荐文献。系统可以发现 PMC 全文链接，但全文下载、正文解析和正式方法学质量评价不在本阶段范围内。
+当前 MVP 仍然根据题录和摘要推荐文献。系统可以发现 PMC 全文资源，并在用户选择文献后下载 PDF 或其他可阅读格式；正文解析和正式方法学质量评价不在本阶段范围内。
+
+## 当前实现状态（2026-08-17）
+
+| 能力 | 状态 | 实现边界 |
+|---|---|---|
+| PubMed Searcher | 已实现 | ESearch + EFetch，题录与摘要，每次最多 100 篇 |
+| Europe PMC Searcher | 已实现 | REST `core` 检索、全文资源线索，每次最多 100 篇 |
+| Semantic Scholar Searcher | 已实现 | Academic Graph API，支持相关性和日期倒序，每次最多 100 篇 |
+| PMC Searcher | 已实现 | `db=pmc` 的 ESearch + JATS EFetch；下载资格另行解析 |
+| bioRxiv Searcher | 已实现 | 接收 Europe PMC 发现的 DOI，调用官方 API 校验并补充元数据 |
+| medRxiv Searcher | 已实现 | 接收 Europe PMC 发现的 DOI，调用官方 API 校验并补充元数据 |
+| Google Scholar Searcher | 暂缓 | 没有适合本项目的稳定官方检索 API，不采用页面抓取或非官方代理 |
+| PMC OA Resolver / Downloader | 已实现 | PMCID 资源解析；用户确认后下载，记录大小、SHA-256 和本地路径 |
+| 多来源结果 Normalizer | 已实现 | 六个来源统一为 `EvidenceRecord` / `UnifiedSearchResult`；不负责去重、持久化或研究类型推断 |
+| 确定性跨来源 Deduplicator | 已实现 | DOI、PMID、PMCID 精确匹配；无强标识符时使用题名+年份+第一作者兜底，并保留来源簇 |
+| LangGraph 检索 fan-out/fan-in | 已实现 | 使用 `Send` 并行调用注册后端，统一结果后去重并形成质量评价分组 |
+| Redis 工作缓存 | 已实现 | 保存任务状态、检索运行和分组的文章 ID；不保存摘要正文，不作为事实数据库 |
+
+因此第一版已完成 6 个计划内的逻辑检索器。bioRxiv 和 medRxiv 的“搜索”由 Europe PMC 关键词发现与各自官方 DOI 校验两步共同完成，不能把官方 DOI 接口描述成自由关键词搜索 API。
 
 ## 已确认的产品决策
 
@@ -147,6 +166,8 @@ PMC 拆分为两个职责明确的组件：
 
 - `PMCSearcher` 通过 NCBI ESearch 的 `db=pmc` 进行补充关键词检索，再有界获取题录和摘要。
 - `PMCOAResolver` 接收 PMCID 并调用 PMC OA Web Service，返回平台报告的 license、撤稿标记和可用资源链接与格式。
+- `PMCOADownloader` 只在用户选择文献后下载解析出的资源，优先 PDF，其次 EPUB、XML、HTML、纯文本和 OA Service 提供的压缩包；下载过程写入临时文件，完成后原子替换，并记录文件大小、SHA-256、内容类型和本地路径。
+- PMC OA Service 正在迁移到 Cloud Service。解析器是独立边界，后续可以替换为 Cloud inventory resolver；下载器不依赖具体的资源发现接口，也不猜测 PMC 文件路径。
 
 OA Service 不是关键词搜索 API。系统只在去重后对保留的候选文献调用它，避免对几百篇重复文献逐条解析全文链接。
 
@@ -263,8 +284,10 @@ intent_node
 -> search_plan_node
 -> compile_queries_node
 -> 主检索 fan-out：PubMed + Europe PMC
--> 平台结果统一化和持久化
--> 主检索 fan-in 和去重
+-> 原始平台结果先写入 source_records
+-> 结果统一化为 EvidenceRecord
+-> 主检索 fan-in 和当前批次去重
+-> articles 身份匹配、写入并回填 source_records.article_id
 -> 初步摘要相关性评价
 -> LLM sufficiency_router
    -> 证据充分：进入最终排序
@@ -282,12 +305,34 @@ fan-in 使用基于 ID 的幂等 reducer，不能继续使用简单的 `operator
 ## 数据持久化
 
 - 每调用一次数据源，就创建一条 `search_runs` 记录。
-- 平台原始记录写入 `source_records.raw_payload`。
-- 统一化和去重后的文献写入或关联到 `articles`。
+- 平台原始记录首先写入 `source_records.raw_payload`，即使后续标准化或去重失败也保留。
+- 当前批次由确定性 `Deduplicator` 在内存中处理，输入规模限制在本次检索返回的记录数，不加载历史全库。
+- 去重后的规范文献通过 PostgreSQL 的 DOI、PMID、PMCID 唯一索引和题名兜底查询写入或关联到 `articles`。
+- 成功匹配后回填 `source_records.article_id`；因此一个规范文献可以关联多个来源和多次检索运行。
 - 发现的 OA 和可下载资源写入 `full_text_resources`。
 - 持久化层使用固定的 SQLAlchemy Repository 方法和事务，不使用 text-to-SQL。
 
+## Redis 与后台任务
+
+Redis 只作为短期工作缓存，不替代 PostgreSQL：
+
+- `task:{task_id}:status` 保存任务状态和少量监测字段；
+- `search_run:{search_run_id}:article_ids` 保存当前检索运行的有序文章 ID；
+- `task:{task_id}:group:{group_name}:article_ids` 保存质量评价分组的文章 ID；
+- `json:*` 保存带 TTL 的小型意图或充分性判断结果。
+
+缓存默认 24 小时，Redis 故障时主流程可以降级为直接查询 PostgreSQL。第一版不引入
+Celery：每个数据源最多返回 100 篇，LangGraph fan-out/fan-in 与 `asyncio` 足以完成当前
+批量处理。未来接入 Celery 时，broker 消息只携带 `task_id`、`search_run_id` 和分组 ID，
+worker 根据 ID 从 PostgreSQL 读取文献，不把摘要正文或完整文献列表放进消息队列。
+
 在保存预印本文献之前，`articles` 表需要增加同行评议状态和预印本来源字段。具体数据库迁移步骤放入后续实现计划。
+
+## 质量评价前的分组
+
+文献必须先完成统一化、跨来源去重和持久化，再进入分组。第一版以确定性规则为主：根据来源已提供的研究类型、研究方向和标准化关键词形成分组；研究类型缺失、字段冲突或无法归类时，才把统一后的题名和摘要交给 LLM 补判。
+
+分组节点不读取各平台原始 JSON，也不让 LLM 自由生成组名。所有组名和研究类型均受 Pydantic 枚举约束，并记录规则分类与 LLM 补判的数量、耗时、Token 和置信度，供离线评测比较。
 
 ## 失败处理
 
@@ -324,20 +369,18 @@ Pydantic 负责校验每个检索请求、平台响应边界、统一文献记�
 
 ## 实现顺序
 
-1. 增加共享枚举、`SearchPlan` 扩展字段、统一文献契约和数据库字段迁移。
+1. 增加共享枚举、`SearchPlan` 扩展字段、统一文献契约和数据库字段迁移。（统一文献契约已完成）
 2. 实现 `SourceRouter` 和追问状态。
-3. 为现有 PubMed 和 Europe PMC 结果增加 Normalizer。
+3. 为全部六个检索来源增加 Normalizer。（已完成）
 4. 实现 Semantic Scholar Connector 和 Compiler。
-5. 实现 PMC Searcher 和 PMC OA Resolver。
+5. 实现 PMC Searcher、PMC OA Resolver 和用户触发的 PMC OA Downloader。
 6. 实现 bioRxiv/medRxiv 发现与官方 API 补充流程。
-7. 增加 Repository 和各平台持久化服务。
-8. 实现主检索 fan-out/fan-in 和确定性去重。
-9. 实现初步摘要相关性评价与 LLM Sufficiency Evaluator。
-10. 实现条件补充检索 fan-out 和最终合并排序。
+7. 增加原始 `source_records` 写入、规范 `articles` 身份匹配和全文资源 Repository。
+8. 实现初步摘要相关性评价与 LLM Sufficiency Evaluator。
+9. 实现条件补充检索 fan-out 和最终合并排序。
 
 ## 本阶段不实现
 
-- 将全文文件下载到本地。
 - 解析 JATS XML、PDF、EPUB 或 HTML 全文。
 - 正式的偏倚风险和证据质量评价。
 - 证据综合与学术报告生成。

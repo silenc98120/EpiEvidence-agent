@@ -1,0 +1,33 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local secrets and machine-specific settings
+.env
+.env.*
+!.env.example
+.idea/
+
+# Local generated data
+data/mesh.sqlite3
+data/*.sqlite3.tmp
+data/2026JCRJournals.xlsx
+
+# Third-party reference documents (not redistributed)
+docs/qualityevaldocs/
+
+# Test caches
+.pytest_cache/
+.pytest-cache/
+
+# Local tool caches and scratch files
+.tmp/
+.uv-cache/
+test_localsystem.txt
