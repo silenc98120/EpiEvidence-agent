@@ -36,6 +36,8 @@ class EvidenceState(MessagesState):
     mesh_normalization: dict[str, Any]
     # 数据库无关检索计划
     search_plan:dict[str,Any]
+    # Agent 根据研究问题选择的检索数据源及理由
+    search_source_decision: dict[str, Any]
     # 允许本次任务调用的数据源；为空时由图使用已注册的全部后端
     search_sources: list[str]
     # 每个 Send 分支返回的统一检索结果，fan-in 节点消费该字段

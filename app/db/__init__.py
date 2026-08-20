@@ -1,6 +1,7 @@
 """Database access primitives for EpiEvidence."""
 
 from .base import Base
+from .repositories import SearchResultsRepository
 from .models import (
     ArticleORM,
     FullTextResourceORM,
@@ -23,6 +24,7 @@ __all__ = [
     "SearchRunORM",
     "SourceRecordORM",
     "TaskORM",
+    "SearchResultsRepository",
     "build_async_engine",
     "build_session_factory",
     "get_database_url",

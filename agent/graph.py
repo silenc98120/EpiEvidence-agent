@@ -41,6 +41,7 @@ from app.core.search_strategy_generator import (
     SearchPlanBuilder,
     SearchSource,
 )
+from app.core.search_source_selector import SearchSourceSelector
 from skills.quality_evaluator.schema import StudyType
 
 
@@ -172,6 +173,30 @@ def create_search_plan_node(builder: SearchPlanBuilder):
     return search_plan_node
 
 
+def create_search_source_selector_node(
+    selector: SearchSourceSelector,
+    available_sources: Mapping[SearchSource, SearchBackend],
+):
+    """Create the Agent node that chooses databases after building SearchPlan."""
+
+    async def search_source_selector_node(state: EvidenceState) -> dict[str, Any]:
+        intent = IntentRecognitionResult.model_validate(state["intent_analysis"])
+        plan = SearchPlan.model_validate(state["search_plan"])
+        decision = selector.select(
+            user_query=state.get("user_query", ""),
+            intent=intent,
+            search_plan=plan,
+            available_sources=available_sources.keys(),
+        )
+        return {
+            "search_sources": [source.value for source in decision.selected_sources],
+            "search_source_decision": decision.model_dump(mode="json"),
+            "task_stage": "search_sources_selected",
+        }
+
+    return search_source_selector_node
+
+
 def create_search_fanout_node(
     backends: Mapping[SearchSource, SearchBackend],
 ):
@@ -229,6 +254,7 @@ def create_search_source_node(
     *,
     normalizer: SearchResultsNormalizer | None = None,
     work_cache: RedisWorkCache | None = None,
+    persistence: Any | None = None,
 ):
     """创建单个 Send 搜索分支。
 
@@ -242,15 +268,56 @@ def create_search_source_node(
         source = SearchSource(branch["source"])
         backend = backends[source]
         search_run_id = str(uuid4())
+        compiled_query = ""
+        persistence_failed = False
         try:
             plan = SearchPlan.model_validate(branch["search_plan"])
             compiled = backend.compiler.compile(plan)
+            compiled_query = compiled.query
             request = backend.request_factory(compiled, search_run_id)
-            provider_result = backend.search(request)
-            if inspect.isawaitable(provider_result):
-                provider_result = await provider_result
+            try:
+                provider_result = backend.search(request)
+                if inspect.isawaitable(provider_result):
+                    provider_result = await provider_result
+            except Exception as exc:
+                if persistence is not None:
+                    persistence_failed = True
+                    try:
+                        await persistence.persist_search_failure(
+                            task_id=branch["task_id"],
+                            user_query=branch.get("user_query", ""),
+                            search_run_id=search_run_id,
+                            source=source.value,
+                            compiled_query=compiled_query,
+                            error_type=type(exc).__name__,
+                            error_message="搜索源请求失败",
+                        )
+                    except Exception:
+                        raise
+                    persistence_failed = False
+                raise
 
-            if backend.persist_raw_result is not None:
+            if isinstance(provider_result, UnifiedSearchResult):
+                unified = provider_result
+            else:
+                unified = result_normalizer.normalize_result(provider_result)
+
+            if persistence is not None:
+                persistence_failed = True
+                try:
+                    await persistence.persist_search_result(
+                        task_id=branch["task_id"],
+                        user_query=branch.get("user_query", ""),
+                        search_run_id=search_run_id,
+                        source=source.value,
+                        compiled_query=compiled_query,
+                        provider_result=provider_result,
+                        unified_result=unified,
+                    )
+                except Exception:
+                    raise
+                persistence_failed = False
+            elif backend.persist_raw_result is not None:
                 persisted = backend.persist_raw_result(
                     source,
                     search_run_id,
@@ -258,11 +325,6 @@ def create_search_source_node(
                 )
                 if inspect.isawaitable(persisted):
                     await persisted
-
-            if isinstance(provider_result, UnifiedSearchResult):
-                unified = provider_result
-            else:
-                unified = result_normalizer.normalize_result(provider_result)
 
             if work_cache is not None:
                 await work_cache.replace_search_run_article_ids(
@@ -274,6 +336,15 @@ def create_search_source_node(
                 "search_branch_results": [unified.model_dump(mode="json")],
             }
         except Exception as exc:
+            if persistence_failed:
+                logger.bind(
+                    component="search_graph",
+                    event="search_persistence_failed",
+                    source=source.value,
+                    search_run_id=search_run_id,
+                    error_type=type(exc).__name__,
+                ).exception("搜索结果持久化失败")
+                raise
             logger.bind(
                 component="search_graph",
                 event="search_source_branch_failed",
@@ -304,6 +375,7 @@ def create_search_results_fan_in_node(
     *,
     deduplicator: Deduplicator | None = None,
     work_cache: RedisWorkCache | None = None,
+    persistence: Any | None = None,
 ):
     """创建搜索结果 fan-in 节点，统一汇总并去重。"""
 
@@ -320,6 +392,16 @@ def create_search_results_fan_in_node(
             for record in result.records
         ]
         deduplicated = result_deduplicator.deduplicate(records)
+        persisted_records: list[dict[str, Any]] | None = None
+        if persistence is not None:
+            persisted_records = await persistence.persist_canonical_results(
+                task_id=state["task_id"],
+                all_records=records,
+                canonical_records=deduplicated.records,
+            )
+        search_records = persisted_records or [
+            record.model_dump(mode="json") for record in deduplicated.records
+        ]
         source_statuses = {
             result.source.value: result.status.value for result in unified_results
         }
@@ -331,10 +413,7 @@ def create_search_results_fan_in_node(
                 unique_record_count=deduplicated.unique_count,
             )
         return {
-            "search_results": [
-                record.model_dump(mode="json")
-                for record in deduplicated.records
-            ],
+            "search_results": search_records,
             "search_metrics": {
                 "source_statuses": source_statuses,
                 "source_count": len(unified_results),
@@ -662,11 +741,13 @@ def build_evidence_graph(
     recognizer: IntentRecognizer | None = None,
     mesh_normalizer: MeshNormalizer | None = None,
     search_plan_builder: SearchPlanBuilder | None = None,
+    search_source_selector: SearchSourceSelector | None = None,
     quality_evaluator: QualityEvaluatorCallable | Any | None = None,
     evidence_summarizer: Any | None = None,
     result_normalizer: SearchResultsNormalizer | None = None,
     deduplicator: Deduplicator | None = None,
     work_cache: RedisWorkCache | None = None,
+    persistence: Any | None = None,
 ):
     """构建完整的检索、分组和质量评价图。
 
@@ -699,6 +780,7 @@ def build_evidence_graph(
             backends,
             normalizer=result_normalizer,
             work_cache=work_cache,
+            persistence=persistence,
         ),
     )
     graph.add_node(
@@ -706,6 +788,7 @@ def build_evidence_graph(
         create_search_results_fan_in_node(
             deduplicator=deduplicator,
             work_cache=work_cache,
+            persistence=persistence,
         ),
     )
     graph.add_node("group_articles", create_group_articles_node(work_cache))
@@ -735,10 +818,18 @@ def build_evidence_graph(
             "search_plan",
             create_search_plan_node(search_plan_builder),
         )
+        graph.add_node(
+            "search_source_selector",
+            create_search_source_selector_node(
+                search_source_selector or SearchSourceSelector(),
+                backends,
+            ),
+        )
         graph.add_edge(START, "intent_recognizer")
         graph.add_edge("intent_recognizer", "mesh_normalizer")
         graph.add_edge("mesh_normalizer", "search_plan")
-        graph.add_edge("search_plan", "search_fanout")
+        graph.add_edge("search_plan", "search_source_selector")
+        graph.add_edge("search_source_selector", "search_fanout")
     else:
         graph.add_edge(START, "search_fanout")
 

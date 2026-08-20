@@ -77,3 +77,27 @@ Set `DATABASE_URL` to a PostgreSQL URL. The session module translates
 module does not connect to PostgreSQL or create tables. Production schema changes remain
 the responsibility of reviewed SQL/Alembic migrations; do not call
 `Base.metadata.create_all` as an application startup migration.
+
+## 搜索结果持久化
+
+`app/db/repositories/search_results.py` 中的 `SearchResultsRepository` 是 LangGraph
+搜索图与 PostgreSQL 之间的写入边界。将它传给 `build_evidence_graph` 后：
+
+```python
+from app.db.repositories import SearchResultsRepository
+from app.db.session import build_session_factory
+from agent.graph import build_evidence_graph
+
+session_factory = build_session_factory()
+persistence = SearchResultsRepository(session_factory)
+graph = build_evidence_graph(
+    backends=backends,
+    persistence=persistence,
+    # recognizer、mesh_normalizer、search_plan_builder 等其他依赖
+)
+```
+
+搜索分支会保存 `search_runs` 和 `source_records`；搜索结果 fan-in 去重后会保存
+`articles`、`full_text_resources`，并把所有来源记录回写到规范 `article_id`。这使得
+Quality Evaluator 和 Summarizer 可以根据 canonical UUID 从 PostgreSQL 读取题录，
+而不需要把完整摘要塞进 LangGraph 的消息列表。
