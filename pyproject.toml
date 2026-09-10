@@ -11,13 +11,18 @@ dependencies = [
     "langchain-ollama>=1.1.0",
     "langchain-openai>=1.4.1",
     "langgraph>=1.2.9",
+    "langgraph-checkpoint-postgres>=3.0.0",
     "loguru>=0.7.3",
     "pydantic>=2.13.4",
     "psycopg[binary]>=3.2",
     "redis>=5.2",
+    "celery[redis]>=5.4",
     "sqlalchemy>=2.0",
     "fastapi>=0.141.1",
     "uvicorn>=0.52.4",
+    "celery-types>=0.26.0",
+    "alembic>=1.19.2",
+    "langfuse>=4.15.2",
 ]
 
 [dependency-groups]
@@ -27,3 +32,4 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
