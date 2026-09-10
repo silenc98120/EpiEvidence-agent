@@ -1,14 +1,12 @@
 """Quality Evaluator 的 PostgreSQL 文章读取边界。"""
 
-from __future__ import annotations
-
 from typing import Any
+from uuid import UUID
 
 from sqlalchemy import select
 
-from app.db.models import ArticleORM
-
-from .schema import EvaluationArticle, HydratedArticleBatch, QualityEvaluationJob
+from backend.app.db import ArticleORM, SearchRunORM, SourceRecordORM
+from backend.skills.quality_evaluator.schema import HydratedArticleBatch, QualityEvaluationJob, EvaluationArticle
 
 
 class ArticleRepository:
@@ -21,7 +19,27 @@ class ArticleRepository:
         *,
         user_query: str,
     ) -> HydratedArticleBatch:
-        statement = select(ArticleORM).where(ArticleORM.article_id.in_(job.article_ids))
+        try:
+            task_id = UUID(job.task_id)
+        except ValueError as exc:
+            raise ValueError("质量评估任务的 task_id 必须是 PostgreSQL UUID") from exc
+
+        statement = (
+            select(ArticleORM)
+            .join(
+                SourceRecordORM,
+                SourceRecordORM.article_id == ArticleORM.article_id,
+            )
+            .join(
+                SearchRunORM,
+                SearchRunORM.search_run_id == SourceRecordORM.search_run_id,
+            )
+            .where(
+                ArticleORM.article_id.in_(job.article_ids),
+                SearchRunORM.task_id == task_id,
+            )
+            .distinct()
+        )
         async with self._session_factory() as session:
             rows = list((await session.scalars(statement)).all())
 
