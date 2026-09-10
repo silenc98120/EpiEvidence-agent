@@ -1,37 +1,35 @@
-"""EpiEvidence 的 LangGraph 编排节点。
-
-图中只在 State 里传递结构化决策和文章 ID。搜索分支返回统一结果后由 fan-in
-节点去重，质量评价分支只接收分组和文章 ID；摘要正文由后续 Repository 从
-PostgreSQL 读取，不塞进 Send 消息或 ``messages``。
-"""
-
 from __future__ import annotations
 
 import inspect
-import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import uuid4
 
 from langchain_core.messages import AIMessage
-from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
+from langgraph.graph import END
 from loguru import logger
 from pydantic import BaseModel
 
-from agent.state import EvidenceState
-from agent.summarizer import FinalEvidenceSummary, render_summary_chat
-from app.cache.redis_work_cache import RedisWorkCache
-from app.core.deduplicator import Deduplicator
-from app.core.intent_recognizer import IntentRecognitionResult, IntentRecognizer
-from app.core.mesh_normalizer import MeshNormalizationResult, MeshNormalizer
-from app.core.search_results_normalizer import (
+from backend.agent.state import EvidenceState
+from backend.agent.subgraphs.quality_evaluation import (
+    group_quality_articles,
+    record_article_id,
+    split_quality_batch,
+    study_group_id,
+)
+from backend.agent.summarizer import render_summary_chat
+from backend.app.cache import RedisWorkCache
+from backend.app.core.deduplicator import Deduplicator
+from backend.app.core.intent_recognizer import IntentRecognitionResult, IntentRecognizer
+from backend.app.core.mesh_normalizer import MeshNormalizationResult, MeshNormalizer
+from backend.app.core.search_results_normalizer import (
     SearchResultsNormalizer,
     UnifiedSearchError,
     UnifiedSearchResult,
     UnifiedSearchStatus,
 )
-from app.core.search_strategy_generator import (
+from backend.app.core.search_strategy_generator import (
     CompiledSearchQuery,
     EuropePMCQueryCompiler,
     PMCQueryCompiler,
@@ -41,14 +39,98 @@ from app.core.search_strategy_generator import (
     SearchPlanBuilder,
     SearchSource,
 )
-from app.core.search_source_selector import SearchSourceSelector
-from skills.quality_evaluator.schema import StudyType
+from backend.app.core.search_source_selector import SearchSourceSelector
+from backend.app.observability import LangfuseRuntime
 
 
 RequestFactory = Callable[[CompiledSearchQuery, str], Any]
 SearchCallable = Callable[[Any], Any | Awaitable[Any]]
 RawResultPersister = Callable[[SearchSource, str, Any], Any | Awaitable[Any]]
 QualityEvaluatorCallable = Callable[[dict[str, Any]], Any | Awaitable[Any]]
+
+
+def _mesh_metrics(payload: Mapping[str, Any]) -> dict[str, int]:
+    keywords = payload.get("normalized_keywords", [])
+    if not isinstance(keywords, list):
+        keywords = []
+    matched_keyword_count = sum(
+        bool(keyword.get("mesh_matches"))
+        for keyword in keywords
+        if isinstance(keyword, Mapping)
+    )
+    mesh_match_count = sum(
+        len(keyword.get("mesh_matches", []))
+        for keyword in keywords
+        if isinstance(keyword, Mapping)
+    )
+    return {
+        "normalized_keyword_count": len(keywords),
+        "matched_keyword_count": matched_keyword_count,
+        "unmatched_keyword_count": len(keywords) - matched_keyword_count,
+        "mesh_match_count": mesh_match_count,
+    }
+
+
+def _search_plan_metrics(payload: Mapping[str, Any]) -> dict[str, int]:
+    groups = payload.get("concept_groups", [])
+    if not isinstance(groups, list):
+        groups = []
+    return {
+        "concept_group_count": len(groups),
+        "mesh_heading_count": sum(
+            len(group.get("mesh_headings", []))
+            for group in groups
+            if isinstance(group, Mapping)
+        ),
+        "free_text_term_count": sum(
+            len(group.get("free_text_terms", []))
+            for group in groups
+            if isinstance(group, Mapping)
+        ),
+    }
+
+
+def _search_branch_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
+    branch_results = result.get("search_branch_results", [])
+    if not isinstance(branch_results, list) or not branch_results:
+        return {"status": "missing_search_result"}
+    branch = branch_results[0]
+    if not isinstance(branch, Mapping):
+        return {"status": "invalid_search_result"}
+    error = branch.get("error")
+    return {
+        "source": branch.get("source"),
+        "search_run_id": branch.get("search_run_id"),
+        "status": branch.get("status"),
+        "hit_count": branch.get("hit_count", 0),
+        "retrieved_count": branch.get("retrieved_count", 0),
+        "latency_ms": branch.get("latency_ms"),
+        "normalization_latency_ms": branch.get("normalization_latency_ms"),
+        "error_type": error.get("error_type") if isinstance(error, Mapping) else None,
+    }
+
+
+def _quality_branch_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
+    evaluations = result.get("quality_evaluation_results", [])
+    if not isinstance(evaluations, list) or not evaluations:
+        return {"evaluation_status": "missing_evaluation"}
+    evaluation = evaluations[0]
+    if not isinstance(evaluation, Mapping):
+        return {"evaluation_status": "invalid_evaluation"}
+    payload = evaluation.get("evaluation", {})
+    return {
+        "evaluation_status": payload.get("status") if isinstance(payload, Mapping) else None,
+        "group_id": evaluation.get("group_id"),
+        "article_count": len(evaluation.get("article_ids", [])),
+    }
+
+
+def _summary_answer(result: Mapping[str, Any]) -> str | None:
+    messages = result.get("messages", [])
+    if not isinstance(messages, list) or not messages:
+        return None
+    content = getattr(messages[-1], "content", None)
+    return content if isinstance(content, str) else None
 
 
 @dataclass(frozen=True)
@@ -62,7 +144,7 @@ class SearchBackend:
     persist_raw_result: RawResultPersister | None = None
 
 
-def create_default_search_backends(
+def default_search_backends(
     *,
     pubmed_searcher: Any,
     europe_pmc_searcher: Any,
@@ -77,10 +159,10 @@ def create_default_search_backends(
     已有的 Europe PMC DOI 发现与官方接口校验流程。
     """
 
-    from app.tools.article_search.europepmc import EuropePMCSearchRequest
-    from app.tools.article_search.pmc import PMCSearchRequest
-    from app.tools.article_search.pubmed import PubMedSearchRequest
-    from app.tools.article_search.semantic_scholar import SemanticScholarSearchRequest
+    from backend.app.tools.article_search.europepmc import EuropePMCSearchRequest
+    from backend.app.tools.article_search.pmc import PMCSearchRequest
+    from backend.app.tools.article_search.pubmed import PubMedSearchRequest
+    from backend.app.tools.article_search.semantic_scholar import SemanticScholarSearchRequest
 
     backends = {
         SearchSource.PUBMED: SearchBackend(
@@ -129,7 +211,10 @@ def create_default_search_backends(
     return backends
 
 
-def intent_node(recognizer: IntentRecognizer):
+def intent_node(
+    recognizer: IntentRecognizer,
+    langfuse_runtime: LangfuseRuntime | None = None,
+):
     """创建意图识别节点。"""
 
     async def recognize_intent_node(state: EvidenceState) -> dict[str, Any]:
@@ -139,10 +224,23 @@ def intent_node(recognizer: IntentRecognizer):
             "task_stage": "intent_recognized",
         }
 
-    return recognize_intent_node
+    if langfuse_runtime is None:
+        return recognize_intent_node
+    return langfuse_runtime.wrap_node(
+        name="intent-recognizer",
+        as_type="agent",
+        node=recognize_intent_node,
+        input_metrics=lambda state: {"query": state.get("user_query", "")},
+        output_metrics=lambda result: {
+            "intent_analysis": result.get("intent_analysis", {}),
+        },
+    )
 
 
-def create_mesh_normalizer_node(normalizer: MeshNormalizer):
+def mesh_normalizer_node(
+    normalizer: MeshNormalizer,
+    langfuse_runtime: LangfuseRuntime | None = None,
+):
     """创建 MeSH 标准化节点。"""
 
     def mesh_normalizer_node(state: EvidenceState) -> dict[str, Any]:
@@ -153,10 +251,28 @@ def create_mesh_normalizer_node(normalizer: MeshNormalizer):
             "task_stage": "mesh_normalized",
         }
 
-    return mesh_normalizer_node
+    if langfuse_runtime is None:
+        return mesh_normalizer_node
+    return langfuse_runtime.wrap_node(
+        name="mesh-normalization",
+        as_type="retriever",
+        node=mesh_normalizer_node,
+        input_metrics=lambda state: {
+            "keyword_count": sum(
+                len(candidates)
+                for candidates in state.get("intent_analysis", {}).get("keywords", {}).values()
+            ),
+        },
+        output_metrics=lambda result: _mesh_metrics(
+            result.get("mesh_normalization", {})
+        ),
+    )
 
 
-def create_search_plan_node(builder: SearchPlanBuilder):
+def search_plan_node(
+    builder: SearchPlanBuilder,
+    langfuse_runtime: LangfuseRuntime | None = None,
+):
     """创建数据库无关 SearchPlan 节点。"""
 
     def search_plan_node(state: EvidenceState) -> dict[str, Any]:
@@ -170,12 +286,26 @@ def create_search_plan_node(builder: SearchPlanBuilder):
             "task_stage": "search_plan_built",
         }
 
-    return search_plan_node
+    if langfuse_runtime is None:
+        return search_plan_node
+    return langfuse_runtime.wrap_node(
+        name="search-plan",
+        as_type="chain",
+        node=search_plan_node,
+        input_metrics=lambda state: {
+            "direction_count": len(state.get("intent_analysis", {}).get("directions", [])),
+            **_mesh_metrics(state.get("mesh_normalization", {})),
+        },
+        output_metrics=lambda result: _search_plan_metrics(
+            result.get("search_plan", {})
+        ),
+    )
 
 
-def create_search_source_selector_node(
+def search_source_selector_node(
     selector: SearchSourceSelector,
     available_sources: Mapping[SearchSource, SearchBackend],
+    langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """Create the Agent node that chooses databases after building SearchPlan."""
 
@@ -194,11 +324,27 @@ def create_search_source_selector_node(
             "task_stage": "search_sources_selected",
         }
 
-    return search_source_selector_node
+    if langfuse_runtime is None:
+        return search_source_selector_node
+    return langfuse_runtime.wrap_node(
+        name="search-source-selection",
+        as_type="chain",
+        node=search_source_selector_node,
+        input_metrics=lambda state: {
+            "available_sources": sorted(source.value for source in available_sources),
+            **_search_plan_metrics(state.get("search_plan", {})),
+        },
+        output_metrics=lambda result: {
+            "selected_sources": result.get("search_sources", []),
+            "selected_source_count": len(result.get("search_sources", [])),
+            "decision": result.get("search_source_decision", {}),
+        },
+    )
 
 
-def create_search_fanout_node(
+def search_fanout_node(
     backends: Mapping[SearchSource, SearchBackend],
+    langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """创建搜索 fan-out 路由节点。
 
@@ -235,10 +381,29 @@ def create_search_fanout_node(
             for source in selected_sources
         ]
 
-    return route_search_sources
+    if langfuse_runtime is None:
+        return route_search_sources
+    return langfuse_runtime.wrap_node(
+        name="search-fanout",
+        as_type="chain",
+        node=route_search_sources,
+        input_metrics=lambda state: {
+            "selected_sources": state.get("search_sources", []),
+        },
+        output_metrics=lambda sends: {
+            "branch_count": len(sends),
+            "sources": [
+                getattr(send, "arg", {}).get("source")
+                for send in sends
+            ],
+        },
+    )
 
 
-def create_search_fanout_marker_node(work_cache: RedisWorkCache | None = None):
+def search_fanout_marker_node(
+    work_cache: RedisWorkCache | None = None,
+    langfuse_runtime: LangfuseRuntime | None = None,
+):
     """创建 fan-out 前的阶段标记节点。"""
 
     async def search_fanout_node(state: EvidenceState) -> dict[str, Any]:
@@ -246,15 +411,26 @@ def create_search_fanout_marker_node(work_cache: RedisWorkCache | None = None):
             await work_cache.set_task_status(state["task_id"], "searching")
         return {"task_stage": "searching"}
 
-    return search_fanout_node
+    if langfuse_runtime is None:
+        return search_fanout_node
+    return langfuse_runtime.wrap_node(
+        name="search-dispatch",
+        as_type="chain",
+        node=search_fanout_node,
+        input_metrics=lambda state: {
+            "selected_sources": state.get("search_sources", []),
+        },
+        output_metrics=lambda result: {"task_stage": result.get("task_stage")},
+    )
 
 
-def create_search_source_node(
+def search_source_node(
     backends: Mapping[SearchSource, SearchBackend],
     *,
     normalizer: SearchResultsNormalizer | None = None,
     work_cache: RedisWorkCache | None = None,
     persistence: Any | None = None,
+    langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """创建单个 Send 搜索分支。
 
@@ -368,14 +544,28 @@ def create_search_source_node(
                 "search_branch_results": [failed_result.model_dump(mode="json")],
             }
 
-    return search_source_node
+    if langfuse_runtime is None:
+        return search_source_node
+    return langfuse_runtime.wrap_node(
+        name="literature-search",
+        as_type="retriever",
+        node=search_source_node,
+        input_metrics=lambda branch: {
+            "source": branch.get("source"),
+            "concept_group_count": len(
+                branch.get("search_plan", {}).get("concept_groups", [])
+            ),
+        },
+        output_metrics=_search_branch_metrics,
+    )
 
 
-def create_search_results_fan_in_node(
+def search_results_fan_in_node(
     *,
     deduplicator: Deduplicator | None = None,
     work_cache: RedisWorkCache | None = None,
     persistence: Any | None = None,
+    langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """创建搜索结果 fan-in 节点，统一汇总并去重。"""
 
@@ -425,29 +615,29 @@ def create_search_results_fan_in_node(
             "task_stage": "search_results_merged",
         }
 
-    return search_results_fan_in_node
+    if langfuse_runtime is None:
+        return search_results_fan_in_node
+    return langfuse_runtime.wrap_node(
+        name="search-results-fan-in",
+        as_type="chain",
+        node=search_results_fan_in_node,
+        input_metrics=lambda state: {
+            "source_count": len(state.get("search_branch_results", [])),
+        },
+        output_metrics=lambda result: result.get("search_metrics", {}),
+    )
 
 
-def create_group_articles_node(work_cache: RedisWorkCache | None = None):
+def group_articles_node(
+    work_cache: RedisWorkCache | None = None,
+    langfuse_runtime: LangfuseRuntime | None = None,
+):
     """按确定性研究类型规则分组，不让 LLM 自由生成组名。"""
 
     async def group_articles_node(state: EvidenceState) -> dict[str, Any]:
-        groups: dict[str, list[str]] = {}
-        group_details: dict[str, dict[str, Any]] = {}
-        for record in state.get("search_results", []):
-            article_id = _record_article_id(record)
-            group_id = _study_group_id(record)
-            groups.setdefault(group_id, []).append(article_id)
-            group_details.setdefault(
-                group_id,
-                {
-                    "group_id": group_id,
-                    "study_design": group_id,
-                    "article_ids": [],
-                },
-            )["article_ids"].append(article_id)
-
-        quality_groups = list(group_details.values())
+        groups, quality_groups = group_quality_articles(
+            state.get("search_results", [])
+        )
         if work_cache is not None:
             for group in quality_groups:
                 await work_cache.replace_group_article_ids(
@@ -461,14 +651,84 @@ def create_group_articles_node(work_cache: RedisWorkCache | None = None):
             "task_stage": "articles_grouped",
         }
 
-    return group_articles_node
+    if langfuse_runtime is None:
+        return group_articles_node
+    return langfuse_runtime.wrap_node(
+        name="quality-grouping",
+        as_type="chain",
+        node=group_articles_node,
+        input_metrics=lambda state: {
+            "search_result_count": len(state.get("search_results", [])),
+        },
+        output_metrics=lambda result: {
+            "group_count": len(result.get("quality_groups", [])),
+            "groups": [
+                {
+                    "study_design": group.get("study_design"),
+                    "article_count": len(group.get("article_ids", [])),
+                }
+                for group in result.get("quality_groups", [])
+            ],
+        },
+    )
+def _split_quality_batch(
+    group: Mapping[str, Any],
+    *,
+    max_batch_size: int = 10,
+) -> list[dict[str, Any]]:
+    """兼容旧调用方，实际逻辑由质量评估子图提供。"""
 
+    return split_quality_batch(group, max_batch_size=max_batch_size)
 
-def create_quality_group_router():
+def quality_batcher_node(
+    *,
+    max_batch_size: int = 10,
+    langfuse_runtime: LangfuseRuntime | None = None,
+):
+    """将研究类型分组切割成稳定的质量评估批次。"""
+
+    async def quality_batcher_node(
+        state: EvidenceState,
+    ) -> dict[str, Any]:
+        batches: list[dict[str, Any]] = []
+
+        for group in state.get("quality_groups", []):
+            batches.extend(
+                split_quality_batch(
+                    group,
+                    max_batch_size=max_batch_size,
+                )
+            )
+
+        return {
+            "quality_batches": batches,
+            "task_stage": "quality_batches_created",
+        }
+
+    if langfuse_runtime is None:
+        return quality_batcher_node
+    return langfuse_runtime.wrap_node(
+        name="quality-batching",
+        as_type="chain",
+        node=quality_batcher_node,
+        input_metrics=lambda state: {
+            "group_count": len(state.get("quality_groups", [])),
+            "max_batch_size": max_batch_size,
+        },
+        output_metrics=lambda result: {
+            "batch_count": len(result.get("quality_batches", [])),
+            "batch_article_counts": [
+                len(batch.get("article_ids", []))
+                for batch in result.get("quality_batches", [])
+            ],
+        },
+    )
+
+def quality_group_router():
     """把每个分组派发给独立 Quality Evaluator 分支。"""
 
     def route_quality_groups(state: EvidenceState) -> list[Send] | str:
-        groups = state.get("quality_groups", [])
+        groups = state.get("quality_batches") or state.get("quality_groups", [])
         if not groups:
             return END
         return [
@@ -488,8 +748,10 @@ def create_quality_group_router():
     return route_quality_groups
 
 
-def create_quality_evaluator_node(
+def quality_evaluator_node(
     evaluator: QualityEvaluatorCallable | Any | None = None,
+    *,
+    langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """创建 Quality Evaluator 节点。
 
@@ -543,13 +805,28 @@ def create_quality_evaluator_node(
             ]
         }
 
-    return quality_evaluator_node
+    if langfuse_runtime is None:
+        return quality_evaluator_node
+    return langfuse_runtime.wrap_node(
+        name="quality-evaluation-branch",
+        as_type="agent",
+        node=quality_evaluator_node,
+        input_metrics=lambda branch: {
+            "group_id": branch.get("quality_group", {}).get("group_id"),
+            "study_design": branch.get("quality_group", {}).get("study_design"),
+            "article_count": len(
+                branch.get("quality_group", {}).get("article_ids", [])
+            ),
+        },
+        output_metrics=_quality_branch_metrics,
+    )
 
 
-def create_quality_evaluation_fan_in_node(
+def quality_evaluation_fan_in_node(
     work_cache: RedisWorkCache | None = None,
     *,
     evaluator: QualityEvaluatorCallable | Any | None = None,
+    langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """回收各 Quality Evaluator 分支的结果。"""
 
@@ -637,12 +914,28 @@ def create_quality_evaluation_fan_in_node(
         )
         return result
 
-    return quality_evaluation_fan_in_node
+    if langfuse_runtime is None:
+        return quality_evaluation_fan_in_node
+    return langfuse_runtime.wrap_node(
+        name="quality-evaluation-fan-in",
+        as_type="chain",
+        node=quality_evaluation_fan_in_node,
+        input_metrics=lambda state: {
+            "evaluation_group_count": len(state.get("quality_evaluation_results", [])),
+        },
+        output_metrics=lambda result: {
+            "retained_candidate_count": len(result.get("retained_candidates", [])),
+            "excluded_candidate_count": len(result.get("excluded_candidates", [])),
+            "failure_count": len(result.get("quality_evaluation_failures", [])),
+            "ranked_candidate_count": len(result.get("ranked_candidates", [])),
+        },
+    )
 
 
-def create_evidence_summarizer_node(
+def evidence_summarizer_node(
     summarizer: Any | None,
     work_cache: RedisWorkCache | None = None,
+    langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """把排序后的候选整理成最后一条助手 Chat 消息。"""
 
@@ -667,27 +960,27 @@ def create_evidence_summarizer_node(
             )
             if inspect.isawaitable(result):
                 result = await result
-            summary = (
-                result
-                if isinstance(result, FinalEvidenceSummary)
-                else FinalEvidenceSummary.model_validate(result)
-            )
-            summary_payload = summary.model_dump(mode="json")
+            if not isinstance(result, Mapping):
+                raise ValueError("EvidenceSummarizer 必须返回最终 JSON 对象")
+            summary_payload = dict(result)
+            recommendations = summary_payload.get("recommendations", [])
+            if not isinstance(recommendations, list):
+                raise ValueError("最终 JSON 字段 recommendations 必须是列表")
+            recommended_article_ids = summary_payload.get("recommended_article_ids", [])
+            if not isinstance(recommended_article_ids, list):
+                raise ValueError("最终 JSON 字段 recommended_article_ids 必须是列表")
             message = AIMessage(
-                content=render_summary_chat(summary),
+                content=render_summary_chat(summary_payload),
                 additional_kwargs={
                     "task_id": state["task_id"],
-                    "recommended_article_ids": [
-                        str(article_id)
-                        for article_id in summary.recommended_article_ids
-                    ],
+                    "recommended_article_ids": [str(article_id) for article_id in recommended_article_ids],
                 },
             )
             if work_cache is not None:
                 await work_cache.set_task_status(
                     state["task_id"],
                     "completed",
-                    recommended_count=len(summary.recommendations),
+                    recommended_count=len(recommendations),
                 )
             return {
                 "final_summary": summary_payload,
@@ -732,174 +1025,32 @@ def create_evidence_summarizer_node(
                 "task_stage": "summary_failed",
             }
 
-    return evidence_summarizer_node
-
-
-def build_evidence_graph(
-    *,
-    backends: Mapping[SearchSource, SearchBackend],
-    recognizer: IntentRecognizer | None = None,
-    mesh_normalizer: MeshNormalizer | None = None,
-    search_plan_builder: SearchPlanBuilder | None = None,
-    search_source_selector: SearchSourceSelector | None = None,
-    quality_evaluator: QualityEvaluatorCallable | Any | None = None,
-    evidence_summarizer: Any | None = None,
-    result_normalizer: SearchResultsNormalizer | None = None,
-    deduplicator: Deduplicator | None = None,
-    work_cache: RedisWorkCache | None = None,
-    persistence: Any | None = None,
-):
-    """构建完整的检索、分组和质量评价图。
-
-    如果没有传入前三个组件，图假设调用方已经在 State 中提供了
-    ``intent_analysis``、``mesh_normalization`` 和 ``search_plan``，直接从搜索
-    fan-out 开始，便于单独测试后半段。
-    """
-
-    if not backends:
-        raise ValueError("至少需要注册一个 SearchBackend")
-    if any(
-        value is not None
-        for value in (recognizer, mesh_normalizer, search_plan_builder)
-    ) and not all(
-        value is not None
-        for value in (recognizer, mesh_normalizer, search_plan_builder)
-    ):
-        raise ValueError(
-            "recognizer、mesh_normalizer、search_plan_builder 必须同时提供"
-        )
-
-    graph = StateGraph(EvidenceState)
-    graph.add_node(
-        "search_fanout",
-        create_search_fanout_marker_node(work_cache),
-    )
-    graph.add_node(
-        "search_source",
-        create_search_source_node(
-            backends,
-            normalizer=result_normalizer,
-            work_cache=work_cache,
-            persistence=persistence,
-        ),
-    )
-    graph.add_node(
-        "search_results_fan_in",
-        create_search_results_fan_in_node(
-            deduplicator=deduplicator,
-            work_cache=work_cache,
-            persistence=persistence,
-        ),
-    )
-    graph.add_node("group_articles", create_group_articles_node(work_cache))
-    graph.add_node(
-        "quality_evaluator",
-        create_quality_evaluator_node(quality_evaluator),
-    )
-    graph.add_node(
-        "quality_evaluation_fan_in",
-        create_quality_evaluation_fan_in_node(
-            work_cache,
-            evaluator=quality_evaluator,
-        ),
-    )
-    graph.add_node(
-        "evidence_summarizer",
-        create_evidence_summarizer_node(evidence_summarizer, work_cache),
-    )
-
-    if recognizer is not None:
-        graph.add_node("intent_recognizer", intent_node(recognizer))
-        graph.add_node(
-            "mesh_normalizer",
-            create_mesh_normalizer_node(mesh_normalizer),
-        )
-        graph.add_node(
-            "search_plan",
-            create_search_plan_node(search_plan_builder),
-        )
-        graph.add_node(
-            "search_source_selector",
-            create_search_source_selector_node(
-                search_source_selector or SearchSourceSelector(),
-                backends,
+    if langfuse_runtime is None:
+        return evidence_summarizer_node
+    return langfuse_runtime.wrap_node(
+        name="evidence-summary",
+        as_type="chain",
+        node=evidence_summarizer_node,
+        input_metrics=lambda state: {
+            "ranked_candidate_count": len(state.get("ranked_candidates", [])),
+            "search_metrics": state.get("search_metrics", {}),
+        },
+        output_metrics=lambda result: {
+            "summary_status": result.get("task_stage"),
+            "answer": _summary_answer(result.get("final_summary")),
+            "recommendation_count": len(
+                result.get("final_summary", {}).get("recommendations", [])
+                if isinstance(result.get("final_summary"), Mapping)
+                else []
             ),
-        )
-        graph.add_edge(START, "intent_recognizer")
-        graph.add_edge("intent_recognizer", "mesh_normalizer")
-        graph.add_edge("mesh_normalizer", "search_plan")
-        graph.add_edge("search_plan", "search_source_selector")
-        graph.add_edge("search_source_selector", "search_fanout")
-    else:
-        graph.add_edge(START, "search_fanout")
-
-    graph.add_conditional_edges(
-        "search_fanout",
-        create_search_fanout_node(backends),
+            "coverage_gap_count": len(
+                result.get("final_summary", {}).get("coverage_gaps", [])
+                if isinstance(result.get("final_summary"), Mapping)
+                else []
+            ),
+        },
     )
-    graph.add_edge("search_source", "search_results_fan_in")
-    graph.add_edge("search_results_fan_in", "group_articles")
-    graph.add_conditional_edges(
-        "group_articles",
-        create_quality_group_router(),
-    )
-    graph.add_edge("quality_evaluator", "quality_evaluation_fan_in")
-    graph.add_edge("quality_evaluation_fan_in", "evidence_summarizer")
-    graph.add_edge("evidence_summarizer", END)
-    return graph.compile()
 
 
-def _record_article_id(record: Mapping[str, Any]) -> str:
-    for field_name in ("article_id", "canonical_article_id", "source_article_id"):
-        value = record.get(field_name)
-        if value:
-            return str(value)
-    value = record.get("source_record_id")
-    if value:
-        return str(value)
-    raise ValueError("统一文献记录缺少 article_id")
-
-
-def _study_group_id(record: Mapping[str, Any]) -> str:
-    study_design = _clean_group_value(record.get("study_design")) or ""
-    publication_types = "_".join(
-        _clean_group_value(value) or "" for value in record.get("publication_types", [])
-    )
-    normalized = "_".join(part for part in (study_design, publication_types) if part)
-    if study_design in {study_type.value for study_type in StudyType}:
-        return study_design
-
-    aliases = (
-        (
-            ("qualitative_systematic", "qualitative_evidence_synthesis"),
-            StudyType.QUALITATIVE_SYSTEMATIC_REVIEW,
-        ),
-        (("umbrella_review", "review_of_reviews"), StudyType.UMBRELLA_REVIEW),
-        (("meta_analysis", "metaanalysis"), StudyType.META_ANALYSIS),
-        (("systematic_review",), StudyType.SYSTEMATIC_REVIEW),
-        (("randomized", "randomised"), StudyType.RCT),
-        (("case_control",), StudyType.CASE_CONTROL),
-        (("cohort",), StudyType.COHORT),
-    )
-    for needles, study_type in aliases:
-        if any(needle in normalized for needle in needles):
-            return study_type.value
-    if "cross_sectional" in normalized:
-        if "prevalence" in normalized:
-            return StudyType.CROSS_SECTIONAL_PREVALENCE.value
-        return StudyType.CROSS_SECTIONAL_ANALYTICAL.value
-    if "narrative_review" in normalized or "review" in normalized:
-        return StudyType.NARRATIVE_REVIEW.value
-    return "unknown"
-
-
-def _clean_group_value(value: Any) -> str | None:
-    if value is None:
-        return None
-    cleaned = re.sub(
-        r"[^A-Za-z0-9\u4e00-\u9fff]+",
-        "_",
-        str(value).strip().casefold(),
-    )
-    cleaned = cleaned.strip("_")
-    return cleaned or None
+_record_article_id = record_article_id
+_study_group_id = study_group_id
