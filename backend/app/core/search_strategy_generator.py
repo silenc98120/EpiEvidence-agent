@@ -7,6 +7,9 @@ from loguru import logger
 from pydantic import BaseModel, Field, model_validator
 
 from backend.app.core.intent_recognizer import (
+    ConstraintKind,
+    ConstraintOperator,
+    ExplicitConstraint,
     IntentCategory,
     IntentRecognitionResult,
     ResearchDirection,
@@ -63,6 +66,7 @@ class SearchPlan(BaseModel):
 
     directions: list[ResearchDirection] = Field(default_factory=list)
     concept_groups: list[SearchConceptGroup] = Field(min_length=1)
+    explicit_constraints: list[ExplicitConstraint] = Field(default_factory=list)
     within_group_operator: BooleanOperator = BooleanOperator.OR
     between_group_operator: BooleanOperator = BooleanOperator.AND
 
@@ -122,6 +126,7 @@ class SearchPlanBuilder:
             plan = SearchPlan(
                 directions=intent.directions,
                 concept_groups=concept_groups,
+                explicit_constraints=intent.explicit_constraints,
             )
         except Exception as exc:
             latency_ms = (perf_counter() - start_time) * 1000
@@ -184,6 +189,7 @@ class PubMedQueryCompiler:
         start_time = perf_counter()
         groups = [self._compile_group(group, plan) for group in plan.concept_groups]
         query = f" {plan.between_group_operator.value} ".join(groups)
+        query = _append_design_constraints(query, plan.explicit_constraints, source="pubmed")
 
         compiled_query = CompiledSearchQuery(
             source=self.source,
@@ -221,6 +227,7 @@ class EuropePMCQueryCompiler:
         start_time = perf_counter()
         groups = [self._compile_group(group, plan) for group in plan.concept_groups]
         query = f" {plan.between_group_operator.value} ".join(groups)
+        query = _append_design_constraints(query, plan.explicit_constraints, source="europe_pmc")
 
         compiled_query = CompiledSearchQuery(
             source=self.source,
@@ -281,6 +288,48 @@ class SemanticScholarQueryCompiler:
         if group.free_text_terms:
             return group.free_text_terms[0]
         raise ValueError("Semantic Scholar 概念组缺少代表性检索词")
+
+
+_STUDY_DESIGN_FILTERS = {
+    "randomized_controlled_trial": {
+        "pubmed": '"Randomized Controlled Trial"[Publication Type]',
+        "europe_pmc": 'PUBLICATION_TYPE:"Randomized Controlled Trial"',
+    },
+    "prospective_cohort": {
+        "pubmed": '"Cohort Studies"[Mesh] AND prospective[Title/Abstract]',
+        "europe_pmc": 'MESH:"Cohort Studies" AND TITLE_ABS:prospective',
+    },
+    "cohort": {
+        "pubmed": '"Cohort Studies"[Mesh]',
+        "europe_pmc": 'MESH:"Cohort Studies"',
+    },
+    "observational_study": {
+        "pubmed": '"Observational Studies"[Publication Type]',
+        "europe_pmc": 'PUBLICATION_TYPE:"Observational Study"',
+    },
+}
+
+
+def _append_design_constraints(
+    query: str,
+    constraints: list[ExplicitConstraint],
+    *,
+    source: str,
+) -> str:
+    """把受控研究设计约束编译为 AND/NOT 子句。"""
+
+    clauses: list[str] = []
+    for constraint in constraints:
+        if constraint.kind != ConstraintKind.STUDY_DESIGN:
+            continue
+        for value in constraint.normalized_values:
+            try:
+                clause = _STUDY_DESIGN_FILTERS[value][source]
+            except KeyError as exc:
+                raise ValueError(f"不支持的研究设计约束: {value}") from exc
+            operator = "NOT" if constraint.operator == ConstraintOperator.EXCLUDE else "AND"
+            clauses.append(f"{operator} ({clause})")
+    return f"{query} {' '.join(clauses)}".strip()
 
 
 def _log_compilation(

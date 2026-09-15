@@ -128,6 +128,66 @@ class EvidenceRecord(BaseModel):
         return self
 
 
+def infer_study_design(
+    *,
+    study_design: str | None,
+    publication_types: list[str],
+    abstract: str | None,
+) -> str | None:
+    """从来源元数据和摘要保守推断标准研究设计。
+
+    该函数只返回质量评估注册表中的 canonical 值。摘要推断要求出现明确的
+    方法学短语，避免把综述中提到的 ``randomized trial`` 误判为原始 RCT。
+    无法高置信判断时返回 ``None``，由质量子图保留为 ``unknown``。
+    """
+
+    normalized_metadata = " ".join(
+        _single_line(value) or "" for value in [study_design, *publication_types]
+    ).casefold()
+    metadata_rules = (
+        ("meta-analysis", "meta_analysis"),
+        ("meta analysis", "meta_analysis"),
+        ("qualitative systematic", "qualitative_systematic_review"),
+        ("umbrella review", "umbrella_review"),
+        ("systematic review", "systematic_review"),
+        ("narrative review", "narrative_review"),
+        ("case-control", "case_control"),
+        ("case control", "case_control"),
+        ("cohort", "cohort"),
+        ("cross-sectional", "cross_sectional_analytical"),
+        ("cross sectional", "cross_sectional_analytical"),
+        ("randomized controlled trial", "randomized_controlled_trial"),
+        ("randomised controlled trial", "randomized_controlled_trial"),
+    )
+    for marker, canonical in metadata_rules:
+        if marker in normalized_metadata:
+            return canonical
+
+    text = (abstract or "").casefold()
+    if not text:
+        return None
+    # Review markers take precedence: a review can discuss randomized trials without
+    # itself being an RCT.
+    if re.search(r"\b(meta[- ]analysis|systematic review)\b", text):
+        return "meta_analysis" if "meta" in text else "systematic_review"
+    if re.search(r"\b(umbrella review|review of reviews)\b", text):
+        return "umbrella_review"
+    if re.search(r"\b(narrative review|literature review)\b", text):
+        return "narrative_review"
+    if re.search(r"\brandomi[sz]ed.{0,120}\btrial\b", text) or re.search(
+        r"\bparticipants?\s+were\s+randomi[sz]ed\b|\brandomly assigned\b",
+        text,
+    ):
+        return "randomized_controlled_trial"
+    if re.search(r"\b(case[- ]control(?:led)? study|case[- ]control study)\b", text):
+        return "case_control"
+    if re.search(r"\b(prospective|retrospective|population[- ]based) cohort\b", text):
+        return "cohort"
+    if re.search(r"\b(cross[- ]sectional|prevalence survey)\b", text):
+        return "cross_sectional_analytical"
+    return None
+
+
 class UnifiedSearchError(BaseModel):
     error_type: str
     message: str
@@ -306,7 +366,11 @@ def _base_record(
         publication_date=_single_line(publication_date),
         publication_year=publication_year,
         publication_types=_deduplicate_texts(publication_types),
-        study_design=_single_line(study_design),
+        study_design=infer_study_design(
+            study_design=study_design,
+            publication_types=publication_types,
+            abstract=cleaned_abstract,
+        ),
         publication_status=_single_line(publication_status),
         language=_single_line(language),
         keywords=_deduplicate_texts(keywords),

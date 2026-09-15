@@ -37,6 +37,7 @@ class ResearchDirection(StrEnum):
 class ResearchKeywordKind(StrEnum):
     DISEASE = "disease"
     DRUG = "drug"
+    EXPOSURE = "exposure"
     POPULATION = "population"
     INTERVENTION = "intervention"
     COMPARATOR = "comparator"
@@ -44,6 +45,35 @@ class ResearchKeywordKind(StrEnum):
     TIME = "time"
     REGION = "region"
     OTHER = "other"
+
+
+class ConstraintKind(StrEnum):
+    """用户明确提出的研究筛选条件类别。"""
+
+    STUDY_DESIGN = "study_design"
+    POPULATION = "population"
+    TIME = "time"
+    REGION = "region"
+    LANGUAGE = "language"
+    PUBLICATION_TYPE = "publication_type"
+    OTHER = "other"
+
+
+class ConstraintOperator(StrEnum):
+    """显式约束对候选证据集合的作用。"""
+
+    INCLUDE = "include"
+    EXCLUDE = "exclude"
+    PREFER = "prefer"
+
+
+class ExplicitConstraint(BaseModel):
+    """保留用户原始表达及可供下游使用的规范化约束。"""
+
+    kind: ConstraintKind
+    operator: ConstraintOperator
+    raw_text: str = Field(min_length=1, max_length=300)
+    normalized_values: list[str] = Field(default_factory=list, max_length=5)
 
 
 class KeywordCandidate(BaseModel):
@@ -63,14 +93,15 @@ class IntentRecognitionResult(BaseModel):
     keywords: dict[ResearchKeywordKind, list[KeywordCandidate]] = Field(
         default_factory=dict,
     )
+    explicit_constraints: list[ExplicitConstraint] = Field(default_factory=list)
     short_reason: str = Field(min_length=1, max_length=300)
 
     @model_validator(mode="after")
     def validate_simple_chat(self) -> "IntentRecognitionResult":
         if self.intent_category == IntentCategory.SIMPLE_CHAT:
-            if self.directions or self.keywords:
+            if self.directions or self.keywords or self.explicit_constraints:
                 raise ValueError(
-                    "simple_chat 不能包含研究方向或研究关键词"
+                    "simple_chat 不能包含研究方向、研究关键词或显式约束"
                 )
         return self
 
@@ -90,6 +121,10 @@ class IntentRecognizer:
         self._structured_model = model.with_structured_output(
             IntentRecognitionResult,
             include_raw=True,
+            # 智谱兼容端点可能把 JSON 包在 Markdown 围栏中。json_mode 交由
+            # LangChain 的 JSON 解析器清理围栏，再执行 Pydantic 契约校验；
+            # 不使用 OpenAI SDK 的原生 JSON Schema 响应解析。
+            method="json_mode",
         )
         self._system_prompt = self.build_intent_system_prompt()
 
