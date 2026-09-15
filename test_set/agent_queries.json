@@ -1,0 +1,12 @@
+[
+  {
+    "id": "semaglutide-obesity-older-adults",
+    "query": "帮我查一下司美格鲁肽在肥胖人群中的减重效果如何，尤其是老年人群",
+    "expected_intent": "new_research"
+  },
+  {
+    "id": "hello-greeting",
+    "query": "hello，你好呀",
+    "expected_intent": "simple_chat"
+  }
+]

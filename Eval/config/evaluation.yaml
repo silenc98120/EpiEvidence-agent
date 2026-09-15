@@ -1,0 +1,10 @@
+schema_version: quality-evaluation-judge-config-v1
+mode: direct_review
+temperature: 0
+max_concurrency: 1
+max_retries: 2
+rubric_contract_version: quality-rubric-v1
+prompt_versions:
+  routing: routing-judge-v1
+  criterion: criterion-judge-v1
+  ranking: ranking-judge-v1
