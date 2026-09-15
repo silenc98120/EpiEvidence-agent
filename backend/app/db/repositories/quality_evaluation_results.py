@@ -18,6 +18,59 @@ class QualityEvaluationBatchRepository:
     ) -> None:
         self._session_factory = session_factory
 
+    async def register_pending(
+        self,
+        *,
+        task_id: str,
+        batch_id: str,
+        group_id: str,
+        study_type: str,
+        article_ids: list[UUID],
+    ) -> None:
+        """在投递 Celery 前登记 pending 批次，供轮询器立即观察。"""
+        task_uuid = UUID(task_id)
+        statement = (
+            insert(QualityEvaluationBatchORM)
+            .values(
+                quality_evaluation_batch_id=uuid4(),
+                task_id=task_uuid,
+                batch_id=batch_id,
+                group_id=group_id,
+                study_type=study_type,
+                status="pending",
+                attempt_count=0,
+                article_ids=article_ids,
+            )
+            .on_conflict_do_nothing(
+                constraint="uq_quality_evaluation_batches_task_batch"
+            )
+        )
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(statement)
+
+    async def attach_celery_task_id(
+        self,
+        *,
+        task_id: str,
+        batch_id: str,
+        celery_task_id: str,
+    ) -> None:
+        """把 Celery 回执写回 pending 批次；Worker 已领取时保持 processing。"""
+        task_uuid = UUID(task_id)
+        statement = (
+            update(QualityEvaluationBatchORM)
+            .where(
+                QualityEvaluationBatchORM.task_id == task_uuid,
+                QualityEvaluationBatchORM.batch_id == batch_id,
+                QualityEvaluationBatchORM.status == "pending",
+            )
+            .values(celery_task_id=celery_task_id, updated_at=func.now())
+        )
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(statement)
+
     async def claim_for_processing(
         self,
         *,
@@ -95,10 +148,9 @@ class QualityEvaluationBatchRepository:
                 for article_id in evaluation["excluded_article_ids"]
             ]
             assessment_payload = dict(evaluation["assessment"])
-            verification_payload = dict(evaluation["verification"])
             score_payload = [
                 dict(score)
-                for score in evaluation["verified_scores"]
+                for score in evaluation["scores"]
             ]
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError("质量评估完成结果结构不合法") from exc
@@ -113,7 +165,6 @@ class QualityEvaluationBatchRepository:
             .values(
                 status="completed",
                 assessment_payload=assessment_payload,
-                verification_payload=verification_payload,
                 score_payload=score_payload,
                 retained_article_ids=retained_article_ids,
                 excluded_article_ids=excluded_article_ids,

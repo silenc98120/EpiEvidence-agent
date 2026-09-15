@@ -45,7 +45,8 @@ class SearchResultsRepository:
         task_id = _as_uuid(task_id, "task_id")
         search_run_id = _as_uuid(search_run_id, "search_run_id")
         now = datetime.now(timezone.utc)
-        raw_records = _provider_records(provider_result)
+        provider_records = _provider_records(provider_result)
+        raw_records, duplicate_record_count = _deduplicate_provider_records(provider_records)
         normalized_by_source_id = {
             record.source_record_id: record
             for record in getattr(unified_result, "records", [])
@@ -95,7 +96,9 @@ class SearchResultsRepository:
             task_id=str(task_id),
             search_run_id=str(search_run_id),
             source=source,
-            provider_record_count=len(raw_records),
+            provider_record_count=len(provider_records),
+            deduplicated_record_count=len(raw_records),
+            duplicate_source_record_count=duplicate_record_count,
             normalized_record_count=len(normalized_by_source_id),
         ).info("检索来源结果已持久化")
 
@@ -366,6 +369,29 @@ class SearchResultsRepository:
 def _provider_records(provider_result: Any) -> list[Any]:
     records = getattr(provider_result, "records", [])
     return list(records) if isinstance(records, Sequence) else []
+
+
+def _deduplicate_provider_records(records: Sequence[Any]) -> tuple[list[Any], int]:
+    """按来源记录 ID 去重，保留 provider 返回顺序中的第一条。
+
+    同一个 search run 内，部分 provider（尤其分页或重试拼接后的结果）可能重复
+    返回同一条文献。数据库约束 ``uq_source_records_per_run`` 要求
+    ``(search_run_id, source_record_id)`` 唯一，因此必须在持久化边界消除重复；
+    这里不跨 task 或 search run 删除任何历史数据。
+    """
+
+    deduplicated: list[Any] = []
+    seen: set[str] = set()
+    duplicate_count = 0
+    for record in records:
+        payload = _model_dump(record)
+        source_record_id = _source_record_id(record, payload)
+        if source_record_id in seen:
+            duplicate_count += 1
+            continue
+        seen.add(source_record_id)
+        deduplicated.append(record)
+    return deduplicated, duplicate_count
 
 
 def _as_uuid(value: UUID | str, field_name: str) -> UUID:

@@ -20,6 +20,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Float,
     Index,
     Integer,
     SmallInteger,
@@ -35,6 +36,75 @@ from .base import Base
 
 
 UTC_TIMESTAMP = text("CURRENT_TIMESTAMP")
+
+
+class ConversationORM(Base):
+    """用户可见的长期研究会话。"""
+
+    __tablename__ = "conversation"
+
+    conversation_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    preview: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="active", server_default=text("'active'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=UTC_TIMESTAMP
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=UTC_TIMESTAMP
+    )
+
+    messages: Mapped[list["ConversationMessageORM"]] = relationship(
+        back_populates="conversation", cascade="all, delete-orphan", passive_deletes=True
+    )
+    tasks: Mapped[list[TaskORM]] = relationship(
+        primaryjoin="ConversationORM.conversation_id == foreign(TaskORM.conversation_id)",
+        viewonly=True,
+    )
+
+    __table_args__ = (
+        CheckConstraint("length(btrim(title)) > 0", name="ck_conversation_title_not_blank"),
+        CheckConstraint(
+            "status IN ('active', 'running', 'completed', 'failed', 'archived')",
+            name="ck_conversation_status",
+        ),
+        Index("ix_conversation_updated", "updated_at"),
+    )
+
+
+class ConversationMessageORM(Base):
+    """会话中的用户或模型消息；流式消息通过 status 幂等更新。"""
+
+    __tablename__ = "conversation_messages"
+
+    message_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("conversation.conversation_id", ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[UUID | None] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("tasks.task_id", ondelete="SET NULL")
+    )
+    role: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    status: Mapped[str] = mapped_column(
+        Text, nullable=False, default="completed", server_default=text("'completed'")
+    )
+    sequence_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=UTC_TIMESTAMP
+    )
+
+    conversation: Mapped[ConversationORM] = relationship(back_populates="messages")
+
+    __table_args__ = (
+        CheckConstraint("role IN ('user', 'assistant', 'system')", name="ck_conversation_message_role"),
+        CheckConstraint("status IN ('streaming', 'completed', 'failed')", name="ck_conversation_message_status"),
+        CheckConstraint("sequence_no >= 0", name="ck_conversation_message_sequence"),
+        UniqueConstraint("conversation_id", "sequence_no", name="uq_conversation_message_sequence"),
+        Index("ix_conversation_messages_conversation_created", "conversation_id", "created_at"),
+    )
 
 
 class TaskORM(Base):
@@ -352,6 +422,38 @@ class SourceRecordORM(Base):
         ),
         Index("ix_source_records_normalization_status", "normalization_status"),
     )
+
+
+class ArticleEmbeddingORM(Base):
+    """可跨任务复用、按内容与模型版本寻址的文章 dense embedding。"""
+
+    __tablename__ = "article_embeddings"
+
+    article_embedding_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True)
+    article_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("articles.article_id", ondelete="CASCADE"), nullable=False
+    )
+    model_name: Mapped[str] = mapped_column(Text, nullable=False)
+    model_revision: Mapped[str] = mapped_column(Text, nullable=False)
+    representation_version: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    dimension: Mapped[int] = mapped_column(Integer, nullable=False)
+    normalized: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
+    embedding: Mapped[list[float]] = mapped_column(ARRAY(Float), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=UTC_TIMESTAMP
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "article_id", "model_name", "model_revision", "representation_version", "content_hash",
+            name="uq_article_embeddings_identity",
+        ),
+        CheckConstraint("dimension > 0", name="ck_article_embeddings_dimension"),
+        CheckConstraint("content_hash ~ '^[0-9a-f]{64}$'", name="ck_article_embeddings_content_hash"),
+        Index("ix_article_embeddings_article", "article_id"),
+    )
+
 class QualityEvaluationBatchORM(Base):
     """一次固定研究类型质量评估批次的可恢复结果快照。"""
 
@@ -387,7 +489,6 @@ class QualityEvaluationBatchORM(Base):
         nullable=False,
     )
     assessment_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    verification_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     score_payload: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB)
     retained_article_ids: Mapped[list[UUID]] = mapped_column(
         ARRAY(PG_UUID(as_uuid=True)),

@@ -4,15 +4,19 @@ from backend.app.db.base import Base
 from backend.app.db.repositories import (
     ResearchTaskRepository,
     SearchResultsRepository,
+    ArticleEmbeddingRepository,
     TaskPersistenceUnavailable,
 )
 from backend.app.db.models import (
     ArticleORM,
+    ArticleEmbeddingORM,
     FullTextResourceORM,
     QualityEvaluationBatchORM,
     SearchRunORM,
     SourceRecordORM,
     TaskORM,
+    ConversationORM,
+    ConversationMessageORM,
 )
 from backend.app.db.session import (
     build_async_engine,
@@ -25,12 +29,16 @@ from backend.app.db.session import (
 
 __all__ = [
     "ArticleORM",
+    "ArticleEmbeddingORM",
     "Base",
     "FullTextResourceORM",
     "SearchRunORM",
     "SourceRecordORM",
     "TaskORM",
+    "ConversationORM",
+    "ConversationMessageORM",
     "SearchResultsRepository",
+    "ArticleEmbeddingRepository",
     "ResearchTaskRepository",
     "TaskPersistenceUnavailable",
     "QualityEvaluationBatchORM",
