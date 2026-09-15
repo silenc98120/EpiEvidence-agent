@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 from uuid import uuid4
 
@@ -23,6 +26,12 @@ from backend.app.cache import RedisWorkCache
 from backend.app.core.deduplicator import Deduplicator
 from backend.app.core.intent_recognizer import IntentRecognitionResult, IntentRecognizer
 from backend.app.core.mesh_normalizer import MeshNormalizationResult, MeshNormalizer
+from backend.app.core.quality_candidate_selector import (
+    CandidateArticle,
+    EmbeddingClient,
+    QualityCandidateSelector,
+    ResearchProfile,
+)
 from backend.app.core.search_results_normalizer import (
     SearchResultsNormalizer,
     UnifiedSearchError,
@@ -41,12 +50,14 @@ from backend.app.core.search_strategy_generator import (
 )
 from backend.app.core.search_source_selector import SearchSourceSelector
 from backend.app.observability import LangfuseRuntime
+from backend.skills.quality_evaluator.schema import StudyType
 
 
 RequestFactory = Callable[[CompiledSearchQuery, str], Any]
 SearchCallable = Callable[[Any], Any | Awaitable[Any]]
 RawResultPersister = Callable[[SearchSource, str, Any], Any | Awaitable[Any]]
 QualityEvaluatorCallable = Callable[[dict[str, Any]], Any | Awaitable[Any]]
+EmbeddingClientFactory = Callable[[], EmbeddingClient]
 
 
 def _mesh_metrics(payload: Mapping[str, Any]) -> dict[str, int]:
@@ -218,6 +229,14 @@ def intent_node(
     """创建意图识别节点。"""
 
     async def recognize_intent_node(state: EvidenceState) -> dict[str, Any]:
+        existing = state.get("intent_analysis")
+        if existing:
+            # API 路由层已经识别过研究意图时复用其审计结果，避免重复 LLM 调用。
+            result = IntentRecognitionResult.model_validate(existing)
+            return {
+                "intent_analysis": result.model_dump(mode="json"),
+                "task_stage": "intent_recognized",
+            }
         result = await recognizer.recognize(state["user_query"])
         return {
             "intent_analysis": result.model_dump(mode="json"),
@@ -628,6 +647,218 @@ def search_results_fan_in_node(
     )
 
 
+def quality_candidate_selection_node(
+    embedding_client: Any,
+    *,
+    report_directory: Path,
+    max_candidates: int = 50,
+    embedding_store: Any | None = None,
+    langfuse_runtime: LangfuseRuntime | None = None,
+):
+    """在质量评价前按关键词、语义和发表时间选择高相关候选。"""
+
+    if max_candidates < 1:
+        raise ValueError("max_candidates 必须大于 0")
+
+    async def selection_node(state: EvidenceState) -> dict[str, Any]:
+        raw_records = [
+            dict(record)
+            for record in state.get("search_results", [])
+            if isinstance(record, Mapping)
+        ]
+        profile = ResearchProfile.from_intent(
+            state.get("intent_analysis", {}),
+            state.get("mesh_normalization", {}),
+        )
+        records_by_article_id = {
+            record_article_id(record): record
+            for record in raw_records
+        }
+        articles = [
+            CandidateArticle(
+                article_id=article_id,
+                title=str(record.get("title", "")).strip(),
+                abstract=_optional_text(record.get("abstract")),
+                publication_date=_record_publication_date(record),
+                publication_year=_optional_int(record.get("publication_year")),
+                study_design=_optional_text(record.get("study_design")),
+            )
+            for article_id, record in records_by_article_id.items()
+            if str(record.get("title", "")).strip()
+        ]
+        owns_client = callable(embedding_client) and not hasattr(embedding_client, "embed")
+        client = embedding_client() if owns_client else embedding_client
+        embedding_model = str(getattr(client, "model_name", type(client).__name__))
+        try:
+            scores = await QualityCandidateSelector(
+                client,
+                embedding_store=embedding_store,
+            ).rank(
+                profile=profile,
+                articles=articles,
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if owns_client and close is not None:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+
+        selected_records, report_rows, summary = _select_quality_candidates(
+            scores,
+            records_by_article_id=records_by_article_id,
+            max_candidates=max_candidates,
+        )
+        report_status, report_path, report_error_type = _write_candidate_ranking_report(
+            directory=report_directory,
+            task_id=str(state["task_id"]),
+            profile=profile,
+            embedding_model=embedding_model,
+            report_rows=report_rows,
+            summary=summary,
+        )
+        metrics = {
+            **state.get("search_metrics", {}),
+            "quality_candidate_scored_count": len(scores),
+            "quality_candidate_selected_count": len(selected_records),
+            "quality_candidate_report_status": report_status,
+        }
+        return {
+            "search_results": selected_records,
+            "search_metrics": metrics,
+            "quality_candidate_ranking": {
+                **summary,
+                "report_status": report_status,
+                "report_error_type": report_error_type,
+            },
+            "quality_candidate_report_path": report_path,
+            "task_stage": "quality_candidates_selected",
+        }
+
+    if langfuse_runtime is None:
+        return selection_node
+    return langfuse_runtime.wrap_node(
+        name="quality-candidate-selection",
+        as_type="chain",
+        node=selection_node,
+        input_metrics=lambda state: {
+            "deduplicated_article_count": len(state.get("search_results", [])),
+        },
+        output_metrics=lambda result: result.get("quality_candidate_ranking", {}),
+    )
+
+
+def _select_quality_candidates(
+    scores: list[Any],
+    *,
+    records_by_article_id: Mapping[str, dict[str, Any]],
+    max_candidates: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """应用核心干预、研究设计和配额规则，同时保留完整审计行。"""
+
+    supported_study_types = {study_type.value for study_type in StudyType}
+    selected: list[dict[str, Any]] = []
+    selected_by_type: dict[str, int] = {}
+    report_rows: list[dict[str, Any]] = []
+    core_mismatch_count = 0
+    unsupported_design_count = 0
+    global_limit_count = 0
+
+    for rank, score in enumerate(scores, start=1):
+        record = records_by_article_id[score.article.article_id]
+        row = score.as_dict(rank)
+        study_design = study_group_id(record)
+        row["quality_study_design"] = study_design
+        selection_status = "selected"
+        exclusion_reason: str | None = None
+        if not score.core_intervention_matched:
+            selection_status = "not_selected"
+            exclusion_reason = "core_intervention_not_matched"
+            core_mismatch_count += 1
+        elif study_design not in supported_study_types:
+            selection_status = "not_selected"
+            exclusion_reason = "unsupported_study_design"
+            unsupported_design_count += 1
+        elif len(selected) >= max_candidates:
+            selection_status = "not_selected"
+            exclusion_reason = "global_candidate_limit_reached"
+            global_limit_count += 1
+        else:
+            selected_by_type[study_design] = selected_by_type.get(study_design, 0) + 1
+            selected.append(record)
+        row["selection_status"] = selection_status
+        row["selection_exclusion_reason"] = exclusion_reason
+        report_rows.append(row)
+
+    return selected, report_rows, {
+        "scoring_version": "quality-candidate-ranking-v1",
+        "weights": {
+            "keyword_similarity": 0.50,
+            "embedding_similarity": 0.40,
+            "recency": 0.10,
+        },
+        "scored_article_count": len(scores),
+        "selected_article_count": len(selected),
+        "selected_by_study_type": selected_by_type,
+        "core_intervention_not_matched_count": core_mismatch_count,
+        "unsupported_study_design_count": unsupported_design_count,
+        "global_limit_excluded_count": global_limit_count,
+        "max_candidates": max_candidates,
+    }
+
+
+def _write_candidate_ranking_report(
+    *,
+    directory: Path,
+    task_id: str,
+    profile: ResearchProfile,
+    embedding_model: str,
+    report_rows: list[dict[str, Any]],
+    summary: Mapping[str, Any],
+) -> tuple[str, str, str | None]:
+    """写入轻量 JSON 审计产物；文件系统失败不阻塞质量评价。"""
+
+    report_path = directory / f"quality-candidate-ranking-{task_id}.json"
+    payload = {
+        "task_id": task_id,
+        "embedding_model": embedding_model,
+        "query_profile": profile.query_text,
+        "summary": dict(summary),
+        "ranking": report_rows,
+    }
+    try:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return "failed", str(report_path), type(exc).__name__
+    return "written", str(report_path), None
+
+
+def _record_publication_date(record: Mapping[str, Any]) -> date | None:
+    value = _optional_text(record.get("publication_date"))
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value[:10])
+    except ValueError:
+        return None
+
+
+def _optional_text(value: Any) -> str | None:
+    cleaned = str(value).strip() if value is not None else ""
+    return cleaned or None
+
+
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def group_articles_node(
     work_cache: RedisWorkCache | None = None,
     langfuse_runtime: LangfuseRuntime | None = None,
@@ -874,13 +1105,10 @@ def quality_evaluation_fan_in_node(
         else:
             raise TypeError("Quality evaluator finalize 必须返回结构化结果")
 
-        verification_results = [
-            group["verification"] for group in group_results if "verification" in group
-        ]
-        verified_assessments = [
+        scored_assessments = [
             score
             for group in group_results
-            for score in group.get("verified_scores", [])
+            for score in group.get("scores", [])
         ]
         retained_ids = {
             str(article_id)
@@ -894,17 +1122,16 @@ def quality_evaluation_fan_in_node(
         }
         result.update(
             {
-                "verification_results": verification_results,
                 "quality_evaluation_failures": failures,
-                "verified_assessments": verified_assessments,
+                "scored_assessments": scored_assessments,
                 "retained_candidates": [
                     score
-                    for score in verified_assessments
+                    for score in scored_assessments
                     if str(score["article_id"]) in retained_ids
                 ],
                 "excluded_candidates": [
                     score
-                    for score in verified_assessments
+                    for score in scored_assessments
                     if str(score["article_id"]) in excluded_ids
                 ],
                 "portfolio_evaluation": outcome_payload.get("portfolio_evaluation"),

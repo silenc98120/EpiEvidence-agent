@@ -26,7 +26,9 @@ from backend.app.core.search_results_normalizer import (
 )
 from backend.app.core.search_strategy_generator import SearchPlanBuilder, SearchSource
 from backend.app.core.search_source_selector import SearchSourceSelector
-from backend.app.db.repositories import SearchResultsRepository
+from backend.app.core.llm_provider import create_embedding_client, normalize_openai_base_url
+from backend.app.db.repositories import ArticleEmbeddingRepository, SearchResultsRepository
+from backend.app.db.repositories.quality_evaluation_results import QualityEvaluationBatchRepository
 from backend.app.db.session import build_session_factory
 from backend.app.observability import LangfuseRuntime
 
@@ -41,6 +43,7 @@ from backend.agent.nodes import (
     search_fanout_marker_node,
     search_source_node,
     search_results_fan_in_node,
+    quality_candidate_selection_node,
     group_articles_node,
     quality_batcher_node,
     quality_group_router,
@@ -87,8 +90,13 @@ default_mesh_normalizer = _build_default_mesh_normalizer()
 default_search_backends = _build_default_search_backends()
 
 model = ChatOpenAI(
-    model=os.getenv("LLM_MODEL","deepseek-v4.1-flash"),
-    base_url=os.getenv("LLM_BASE_URL","https://app.deepseek.cn/v1"),
+    model=os.getenv("LLM_MODEL","glm-5.3-flash"),
+    base_url=normalize_openai_base_url(
+        os.getenv(
+            "LLM_BASE_URL",
+            "https://open.bigmodel.cn/api/paas/v4",
+        )
+    ),
     api_key=os.getenv("LLM_API_KEY"),
     temperature=float(os.getenv("LLM_TEMPERATURE","0.0")),
     timeout=float(os.getenv("LLM_TIMEOUT_SECONDS","120")),
@@ -124,6 +132,7 @@ def build_evidence_graph(
     checkpointer: Any | None = None,
     quality_evaluation_subgraph: Any | None = None,
     quality_batch_dispatcher: Any | None = None,
+    quality_batch_repository: Any | None = None,
     quality_batch_reader: Any | None = None,
     quality_batch_hydrator: Any | None = None,
     quality_reason_summarizer: Any | None = None,
@@ -133,6 +142,10 @@ def build_evidence_graph(
     quality_poll_interval_seconds: float = 2.0,
     quality_max_poll_interval_seconds: float = 10.0,
     quality_wait_timeout_seconds: float = 900.0,
+    embedding_client: Any | None = None,
+    article_embedding_store: Any | None = None,
+    quality_candidate_report_directory: Path | None = None,
+    quality_candidate_limit: int = 50,
     langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """构建完整的检索、分组和质量评价图。
@@ -180,6 +193,22 @@ def build_evidence_graph(
             langfuse_runtime=langfuse_runtime,
         ),
     )
+    if embedding_client is not None:
+        graph.add_node(
+            "quality_candidate_selection",
+            quality_candidate_selection_node(
+                embedding_client,
+                report_directory=(
+                    quality_candidate_report_directory
+                    or Path(__file__).resolve().parents[2]
+                    / "artifacts"
+                    / "candidate-rankings"
+                ),
+                max_candidates=quality_candidate_limit,
+                embedding_store=article_embedding_store,
+                langfuse_runtime=langfuse_runtime,
+            ),
+        )
     use_quality_subgraph = quality_evaluator is None
     if use_quality_subgraph:
         compiled_quality_subgraph = quality_evaluation_subgraph
@@ -188,6 +217,7 @@ def build_evidence_graph(
                 work_cache=work_cache,
                 checkpointer=None,
                 dispatcher=quality_batch_dispatcher,
+                batch_repository=quality_batch_repository,
                 reader=quality_batch_reader,
                 hydrator=quality_batch_hydrator,
                 reason_summarizer=quality_reason_summarizer,
@@ -275,7 +305,14 @@ def build_evidence_graph(
     )
     graph.add_edge("search_source", "search_results_fan_in")
     if use_quality_subgraph:
-        graph.add_edge("search_results_fan_in", "quality_evaluation")
+        graph.add_edge(
+            "search_results_fan_in",
+            "quality_candidate_selection"
+            if embedding_client is not None
+            else "quality_evaluation",
+        )
+        if embedding_client is not None:
+            graph.add_edge("quality_candidate_selection", "quality_evaluation")
     else:
         graph.add_edge("search_results_fan_in", "group_articles")
         graph.add_edge("group_articles", "quality_batcher")
@@ -332,18 +369,33 @@ def build_application_graph(
     langfuse_runtime: LangfuseRuntime | None = None,
     *,
     session_factory: Any | None = None,
+    checkpointer: Any | None = None,
 ) -> Any:
     """构造供 FastAPI 注入的完整且可持久化的 compiled LangGraph。"""
 
     active_session_factory = session_factory or build_session_factory()
     search_results_repository = SearchResultsRepository(active_session_factory)
+    article_embedding_repository = ArticleEmbeddingRepository(active_session_factory)
+    quality_batch_repository = QualityEvaluationBatchRepository(active_session_factory)
+    embedding_client = create_embedding_client()
     evidence_summarizer = EvidenceSummarizer(
         model=model,
         repository=SummarizerRepository(active_session_factory),
     )
 
-    return build_runtime_evidence_graph(
+    compiled_graph = build_runtime_evidence_graph(
         langfuse_runtime=langfuse_runtime,
         persistence=search_results_repository,
+        article_embedding_store=article_embedding_repository,
         evidence_summarizer=evidence_summarizer,
+        quality_batch_repository=quality_batch_repository,
+        embedding_client=embedding_client,
+        checkpointer=checkpointer,
     )
+    # FastAPI lifespan 通过该私有资源句柄完成模型预加载和关闭；图本身只消费 Adapter。
+    try:
+        setattr(compiled_graph, "_embedding_client_resource", embedding_client)
+    except (AttributeError, TypeError):
+        # 测试可以把图构造器替换为 str 等不可挂载属性的轻量返回值。
+        pass
+    return compiled_graph

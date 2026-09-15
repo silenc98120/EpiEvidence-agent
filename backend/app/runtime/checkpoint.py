@@ -6,9 +6,40 @@ PostgreSQL saver 是可选运行时依赖，导入业务模块时不连接数据
 
 from __future__ import annotations
 
+import asyncio
+import sys
+import warnings
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from typing import Any
+
+def configure_psycopg_event_loop_policy() -> bool:
+    """为 psycopg async 连接配置 Windows Selector event loop。
+
+    psycopg 的异步连接不能运行在 Windows 默认的 ProactorEventLoop 上。API、
+    LangGraph checkpoint 与 Celery Worker 都必须在创建事件循环前调用本函数；
+    非 Windows 平台不修改全局 asyncio 配置。
+    """
+
+    if sys.platform != "win32":
+        return False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        selector_policy = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if selector_policy is None:
+        raise RuntimeError(
+            "Windows 上的 PostgreSQL checkpoint 需要 SelectorEventLoop 支持。"
+        )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        asyncio.set_event_loop_policy(selector_policy())
+    return True
+
+
+def configure_checkpoint_event_loop_policy() -> bool:
+    """兼容旧 checkpoint 入口；行为由通用 psycopg 策略实现。"""
+
+    return configure_psycopg_event_loop_policy()
 
 
 @asynccontextmanager

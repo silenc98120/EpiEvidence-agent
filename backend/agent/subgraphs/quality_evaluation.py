@@ -13,6 +13,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, TypedDict
+from uuid import UUID
 
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
@@ -23,6 +24,7 @@ from backend.app.cache import RedisWorkCache
 from backend.app.db.models import QualityEvaluationBatchORM
 from backend.app.db.session import build_session_factory
 from backend.app.observability import LangfuseRuntime
+from backend.app.core.search_results_normalizer import infer_study_design
 from backend.app.workers.celery_app import celery_app
 from backend.skills.quality_evaluator.repository import ArticleRepository
 from backend.skills.quality_evaluator.schema import (
@@ -41,6 +43,7 @@ class QualityEvaluationSubgraphState(TypedDict, total=False):
     search_results: list[dict[str, Any]]
     article_groups: dict[str, list[str]]
     quality_groups: list[dict[str, Any]]
+    unsupported_quality_groups: list[dict[str, Any]]
     quality_batches: list[dict[str, Any]]
     quality_batch_results: list[dict[str, Any]]
     quality_batch_status: dict[str, str]
@@ -144,6 +147,13 @@ def study_group_id(record: Mapping[str, Any]) -> str:
         _clean_group_value(value) or ""
         for value in record.get("publication_types", [])
     )
+    inferred = infer_study_design(
+        study_design=study_design or None,
+        publication_types=list(record.get("publication_types", [])),
+        abstract=record.get("abstract"),
+    )
+    if inferred:
+        return inferred
     normalized = "_".join(part for part in (study_design, publication_types) if part)
     if study_design in {study_type.value for study_type in StudyType}:
         return study_design
@@ -194,7 +204,7 @@ def group_quality_articles(
 def split_quality_batch(
     group: Mapping[str, Any],
     *,
-    max_batch_size: int = 10,
+    max_batch_size: int = 5,
 ) -> list[dict[str, Any]]:
     """将一个研究类型分组稳定地切成可独立执行的批次。"""
 
@@ -250,15 +260,30 @@ def quality_grouping_node(work_cache: RedisWorkCache | None = None):
     return group_node
 
 
-def quality_batcher_node(*, max_batch_size: int = 10):
+def quality_batcher_node(*, max_batch_size: int = 5):
     """创建质量评估子图的批次切分节点。"""
 
     async def batch_node(
         state: QualityEvaluationSubgraphState | EvidenceState,
     ) -> dict[str, Any]:
+        supported_groups: list[dict[str, Any]] = []
+        unsupported_groups: list[dict[str, Any]] = []
+        for group in state.get("quality_groups", []):
+            try:
+                StudyType(str(group["study_design"]))
+            except (KeyError, TypeError, ValueError):
+                unsupported_groups.append(
+                    {
+                        **dict(group),
+                        "status": "not_evaluated",
+                        "reason": "unsupported_study_design",
+                    }
+                )
+            else:
+                supported_groups.append(dict(group))
         batches = [
             batch
-            for group in state.get("quality_groups", [])
+            for group in supported_groups
             for batch in split_quality_batch(
                 group,
                 max_batch_size=max_batch_size,
@@ -266,6 +291,7 @@ def quality_batcher_node(*, max_batch_size: int = 10):
         ]
         return {
             "quality_batches": batches,
+            "unsupported_quality_groups": unsupported_groups,
             "task_stage": "quality_batches_created",
         }
 
@@ -315,6 +341,7 @@ def _build_quality_batch_payload(
 
 def submit_quality_batches_node(
     dispatcher: QualityBatchDispatcher | None = None,
+    batch_repository: Any | None = None,
 ):
     """将质量评估子图生成的 batch 提交给固定研究类型 Celery task。"""
 
@@ -336,11 +363,25 @@ def submit_quality_batches_node(
             study_type = StudyType(payload["job"]["study_type"])
             task_name = QUALITY_TASK_BY_STUDY_TYPE[study_type]
             queue_name = QUALITY_QUEUE_BY_STUDY_TYPE[study_type]
+            if batch_repository is not None:
+                await batch_repository.register_pending(
+                    task_id=str(state["task_id"]),
+                    batch_id=str(payload["batch_id"]),
+                    group_id=str(payload["job"]["group_id"]),
+                    study_type=study_type.value,
+                    article_ids=[UUID(str(article_id)) for article_id in payload["job"]["article_ids"]],
+                )
             result = send(task_name, payload, queue_name)
             if hasattr(result, "id"):
                 celery_task_id = str(result.id)
             else:
                 celery_task_id = str(result)
+            if batch_repository is not None:
+                await batch_repository.attach_celery_task_id(
+                    task_id=str(state["task_id"]),
+                    batch_id=str(payload["batch_id"]),
+                    celery_task_id=celery_task_id,
+                )
             submitted.append(
                 {
                     **batch,
@@ -392,7 +433,6 @@ async def _read_quality_batch_results(
             "attempt_count": row.attempt_count,
             "article_ids": [str(article_id) for article_id in row.article_ids],
             "assessment_payload": row.assessment_payload,
-            "verification_payload": row.verification_payload,
             "score_payload": row.score_payload,
             "retained_article_ids": [
                 str(article_id) for article_id in row.retained_article_ids
@@ -525,8 +565,7 @@ def _group_result_from_batch(
             {
                 "job": job.model_dump(mode="json"),
                 "assessment": batch["assessment_payload"],
-                "verification": batch["verification_payload"],
-                "verified_scores": batch["score_payload"],
+                "scores": batch["score_payload"],
                 "retained_article_ids": [],
                 "excluded_article_ids": [],
             }
@@ -575,7 +614,6 @@ def _article_result_payload(
                 "answerability_reason",
                 "",
             ),
-            "verification_issues": list(score.verification_issues),
         },
     }
 
@@ -618,7 +656,7 @@ def organize_quality_results_node(
             try:
                 group = _group_result_from_batch(task_id=task_id, batch=batch)
                 decision = partition_by_threshold(
-                    group.verified_scores,
+                    group.scores,
                     threshold=threshold,
                 )
                 hydrated = await load_articles(group.job, user_query)
@@ -704,7 +742,7 @@ def rank_and_limit_quality_candidates_node(
             score = article.get("score", {})
             composite = float(
                 article.get(
-                    "corrected_composite_score",
+                    "composite_score",
                     score.get("composite_score", 0.0),
                 )
             )
@@ -757,7 +795,7 @@ def _fallback_quality_summary(article: Mapping[str, Any]) -> dict[str, Any]:
     strengths = [str(item) for item in raw.get("strengths", [])]
     limitations = [str(item) for item in raw.get("limitations", [])]
     evidence_gaps = [str(item) for item in raw.get("evidence_gaps", [])]
-    critical_defects = [str(item) for item in raw.get("verification_issues", [])]
+    critical_defects: list[str] = []
     parts = [*strengths, *limitations, *evidence_gaps]
     return {
         "article_id": str(article["article_id"]),
@@ -902,7 +940,7 @@ def quality_evaluation_exit_node(
                     "publication_year": article.get("publication_year"),
                     "abstract": article.get("abstract"),
                     "study_type": article.get("study_type"),
-                    "corrected_composite_score": article["score"][
+                    "composite_score": article["score"][
                         "composite_score"
                     ],
                     "coverage_contribution_score": float(
@@ -912,9 +950,6 @@ def quality_evaluation_exit_node(
                         "quality_summary",
                         _fallback_quality_summary(article),
                     ),
-                    "verification_issues": article["score_summary"][
-                        "verification_issues"
-                    ],
                 }
                 for article in state.get(
                     "ranked_articles",
@@ -992,9 +1027,10 @@ def _quality_node_output_metrics(
 def build_quality_evaluation_subgraph(
     *,
     work_cache: RedisWorkCache | None = None,
-    max_batch_size: int = 10,
+    max_batch_size: int = 5,
     checkpointer: Any | None = None,
     dispatcher: QualityBatchDispatcher | None = None,
+    batch_repository: Any | None = None,
     reader: QualityBatchReader | None = None,
     hydrator: QualityBatchHydrator | None = None,
     reason_summarizer: QualityReasonSummarizer | None = None,
@@ -1040,7 +1076,7 @@ def build_quality_evaluation_subgraph(
     graph.add_edge("quality_grouping", "quality_batcher")
     add_observed_node(
         "submit_quality_batches",
-        submit_quality_batches_node(dispatcher),
+        submit_quality_batches_node(dispatcher, batch_repository),
     )
     add_observed_node(
         "poll_quality_batches",

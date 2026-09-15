@@ -46,6 +46,9 @@ class EvidenceState(MessagesState):
     search_results: list[dict[str, Any]]
     # 检索源状态、数量、去重冲突等监测指标
     search_metrics: dict[str, Any]
+    # 质量评价前的候选综合排序摘要；完整明细存为本地 JSON 审计产物
+    quality_candidate_ranking: dict[str, Any]
+    quality_candidate_report_path: str
     # 按研究类型形成的质量评价分组
     article_groups: dict[str, list[str]]
     quality_groups: list[dict[str, Any]]
@@ -56,9 +59,8 @@ class EvidenceState(MessagesState):
     quality_evaluation_failures: list[dict[str, Any]]
     # 评价结果；保留旧字段名称以兼容已有调用方
     evaluated_evidence: list[dict[str, Any]]
-    # 核查与程序重算后的派生结果；原始 reducer 结果不删除
-    verification_results: list[dict[str, Any]]
-    verified_assessments: list[dict[str, Any]]
+    # Evaluator 通过结构校验后由程序计算的派生分数
+    scored_assessments: list[dict[str, Any]]
     excluded_candidates: list[dict[str, Any]]
     retained_candidates: list[dict[str, Any]]
     # 集合级覆盖评价和确定性排序结果

@@ -13,6 +13,7 @@ from sqlalchemy import select
 from backend.app.core.llm_provider import create_chat_model
 from backend.app.db.models import TaskORM
 from backend.app.db.session import build_session_factory
+from backend.app.runtime.checkpoint import configure_psycopg_event_loop_policy
 from backend.app.workers.celery_app import celery_app
 from backend.app.workers.celery_contracts import QualityBatchMessage
 from backend.skills.quality_evaluator.evaluator import QualityEvaluatorRuntime
@@ -177,7 +178,7 @@ async def _process_fixed_study_batch(
     message = QualityBatchMessage.model_validate(payload)
     job = message.job
 
-    if job.study_type is not spec.study_type:
+    if job.study_type != spec.study_type.value:
         raise ValueError(
             f"{spec.task_name} 只接受 {spec.study_type.value} 批次"
         )
@@ -261,6 +262,9 @@ def _execute_fixed_study_task(
         if celery_task.request.id
         else None
     )
+    # Windows 上 psycopg async 不支持默认 ProactorEventLoop。此处处于真正执行
+    # Celery task 的进程中，并且紧邻 asyncio.run()，可覆盖 solo 与子进程 worker。
+    configure_psycopg_event_loop_policy()
     message, result = asyncio.run(
         _process_fixed_study_batch(
             payload,

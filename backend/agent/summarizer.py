@@ -113,7 +113,7 @@ def validate_summarizer_input(
         seen.add(article_id)
 
         try:
-            score = float(candidate["corrected_composite_score"])
+            score = float(candidate["composite_score"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
                 f"ranked_candidates[{article_id}] 缺少可转换的综合分"
@@ -372,12 +372,11 @@ class EvidenceSummarizer:
         return {
             **article_payload,
             "rank": rank,
-            "corrected_composite_score": float(candidate["corrected_composite_score"]),
+            "composite_score": float(candidate["composite_score"]),
             "coverage_contribution_score": float(
                 candidate.get("coverage_contribution_score", 0.0)
             ),
             "quality_summary": dict(candidate["quality_summary"]),
-            "verification_issues": list(candidate.get("verification_issues", [])),
         }
 
     @staticmethod
@@ -406,12 +405,11 @@ class EvidenceSummarizer:
                 if article.preferred_full_text
                 else None
             ),
-            "corrected_composite_score": float(candidate["corrected_composite_score"]),
+            "composite_score": float(candidate["composite_score"]),
             "coverage_contribution_score": float(
                 candidate.get("coverage_contribution_score", 0.0)
             ),
             "quality_summary": dict(candidate["quality_summary"]),
-            "verification_issues": list(candidate.get("verification_issues", [])),
             "abstract_summary": generated.abstract_summary,
             "recommendation_reason": generated.recommendation_reason,
         }
@@ -539,7 +537,7 @@ def render_summary_chat(summary: Mapping[str, Any]) -> str:
                 _article_metadata_line(article),
                 f"摘要概括：{article.get('abstract_summary', '')}",
                 f"推荐理由：{article.get('recommendation_reason', '')}",
-                f"摘要阶段综合分：{float(article.get('corrected_composite_score', 0.0)):.1f}；"
+                f"摘要阶段综合分：{float(article.get('composite_score', 0.0)):.1f}；"
                 f"集合覆盖贡献分：{float(article.get('coverage_contribution_score', 0.0)):.1f}",
             ]
         )
@@ -548,7 +546,6 @@ def render_summary_chat(summary: Mapping[str, Any]) -> str:
             quality_text = str(quality_summary.get("summary_text", "")).strip()
             if quality_text:
                 lines.append(f"质量评估概括：{quality_text}")
-        _append_list(lines, "核查提示", article.get("verification_issues", []))
         full_text = article.get("preferred_full_text")
         if isinstance(full_text, Mapping) and full_text.get("url"):
             lines.append(f"全文：[{str(full_text.get('format', 'link')).upper()}]({full_text['url']})")

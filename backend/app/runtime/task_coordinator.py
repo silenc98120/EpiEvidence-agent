@@ -12,6 +12,8 @@ from loguru import logger
 
 from backend.app.db.repositories import TaskPersistenceUnavailable
 from backend.app.api.schemas import TaskError, TaskStage, TaskStatus
+from backend.app.api.schemas import PublicResearchResult
+from backend.app.core.intent_recognizer import IntentCategory, IntentRecognizer
 from backend.app.api.services.agui_events import (
     public_stage,
     run_cancelled,
@@ -60,14 +62,27 @@ class TaskCoordinator:
             broker: EventBroker,
             langfuse: Langfuse | None = None,
             task_persistence: TaskPersistence | None = None,
+            intent_recognizer: IntentRecognizer | None = None,
+            simple_chat_responder: Any | None = None,
+            conversation_store: Any | None = None,
     ) -> None:
         self._graph = graph
         self._store = store
         self._broker = broker
         self._langfuse = langfuse
         self._task_persistence = task_persistence
+        self._intent_recognizer = intent_recognizer
+        self._simple_chat_responder = simple_chat_responder
+        self._conversation_store = conversation_store
         self._running: dict[UUID, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
+
+    def set_graph(self, graph: Any) -> None:
+        """在 API 开始接受请求前注入已编译的运行时图。"""
+
+        if self._running:
+            raise RuntimeError("运行中的任务存在时不能替换 LangGraph")
+        self._graph = graph
 
     async def start(
         self,
@@ -164,6 +179,22 @@ class TaskCoordinator:
         """执行或恢复图，并把快照转换成 API 生命周期事件。"""
 
         await self._broker.publish(run_started(task_id, query))
+        await self._conversation_status(conversation_id, "running")
+        if self._intent_recognizer is not None:
+            try:
+                intent = await self._intent_recognizer.recognize(query)
+            except Exception:
+                await self._fail(
+                    task_id, "intent_recognition_failed", "意图识别失败，请稍后重试", True
+                )
+                self._running.pop(task_id, None)
+                await self._broker.close(task_id)
+                return
+            if intent.intent_category is IntentCategory.SIMPLE_CHAT:
+                await self._complete_simple_chat(task_id, query, intent.short_reason)
+                return
+        else:
+            intent = None
         await self._store.update(
             task_id,
             status=TaskStatus.RUNNING,
@@ -190,6 +221,8 @@ class TaskCoordinator:
             return
 
         state = self._initial_state(task_id, query, conversation_id)
+        if intent is not None:
+            state["intent_analysis"] = intent.model_dump(mode="json")
         previous_stage = "created"
         config = {"configurable": {"thread_id": str(task_id)}}
         graph_input: Any = None if resume else state
@@ -229,6 +262,8 @@ class TaskCoordinator:
             await self._broker.publish(text_content(task_id, result.answer, message_id))
             await self._broker.publish(text_ended(task_id, message_id))
             await self._broker.publish(run_finished(task_id, result))
+            await self._conversation_message(conversation_id, result.answer, task_id)
+            await self._conversation_status(conversation_id, "completed")
             if observation is not None:
                 observation.update(
                     output={
@@ -276,6 +311,31 @@ class TaskCoordinator:
             self._running.pop(task_id, None)
             await self._broker.close(task_id)
 
+    async def _complete_simple_chat(self, task_id: UUID, query: str, reason: str) -> None:
+        """普通对话在 API 层完成，绝不启动文献研究图。"""
+        answer = (
+            await self._simple_chat_responder(query)
+            if self._simple_chat_responder is not None
+            else "你好！我是 EpiEvidence。我可以帮助你检索和初步梳理医学文献；请告诉我想研究的问题。"
+        )
+        result = PublicResearchResult(
+            task_id=task_id, query=query, answer=str(answer),
+            recommendations=[], coverage_gaps=[], conflict_summary=None,
+            no_recommendation_reason=reason, search_overview={},
+        )
+        await self._sync_persistent_status("mark_completed", task_id)
+        await self._store.update(task_id, status=TaskStatus.COMPLETED,
+                                 stage=TaskStage.COMPLETED,
+                                 result=result.model_dump(mode="json"))
+        message_id = f"{task_id}:answer"
+        await self._broker.publish(text_started(task_id, message_id))
+        await self._broker.publish(text_content(task_id, result.answer, message_id))
+        await self._broker.publish(text_ended(task_id, message_id))
+        await self._broker.publish(run_finished(task_id, result))
+        task = await self._store.get(task_id)
+        await self._conversation_message(task.conversation_id if task else None, result.answer, task_id)
+        await self._conversation_status(task.conversation_id if task else None, "completed")
+
     async def cancel(self, task_id: UUID) -> bool:
         """取消本进程中运行的任务。"""
 
@@ -315,8 +375,7 @@ class TaskCoordinator:
             "quality_evaluation_results": [],
             "quality_evaluation_failures": [],
             "evaluated_evidence": [],
-            "verification_results": [],
-            "verified_assessments": [],
+            "scored_assessments": [],
             "excluded_candidates": [],
             "retained_candidates": [],
             "portfolio_evaluation": None,
@@ -340,6 +399,18 @@ class TaskCoordinator:
             error=error,
         )
         await self._broker.publish(run_error(task_id, error))
+        task = await self._store.get(task_id)
+        await self._conversation_status(task.conversation_id if task else None, "failed")
+
+    async def _conversation_status(self, conversation_id: UUID | None, status: str) -> None:
+        if self._conversation_store is not None and conversation_id:
+            try: await self._conversation_store.update_status(conversation_id, status)
+            except Exception: logger.exception("conversation status sync failed")
+
+    async def _conversation_message(self, conversation_id: UUID | None, content: str, task_id: UUID) -> None:
+        if self._conversation_store is not None and conversation_id:
+            try: await self._conversation_store.append(conversation_id, "assistant", content, task_id)
+            except Exception: logger.exception("conversation message sync failed")
 
     async def _prepare_persistent_task(
         self,
