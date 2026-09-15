@@ -1,5 +1,12 @@
 # Project Development Instructions
 
+## Documentation Language
+
+Write project documentation, specifications, plans, ADRs, comments intended for
+project readers, and user-facing engineering explanations in Chinese by default.
+Retain English where it is a necessary technical term, code identifier, API name,
+standard name, or literal value; explain it in Chinese when that improves clarity.
+
 ## Specification-Driven Development
 
 This project uses Specification-Driven Development (SDD) with an OpenSpec-style workflow.

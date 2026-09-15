@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Langfuse 监测术语速查</title>
+  <link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">EpiEvidence 学习速查</p>
+    <h1>Langfuse 监测术语速查</h1>
+    <p class="lede">只保留当前项目需要的五个概念。</p>
+    <section class="panel"><h2>Trace</h2><p>一次完整用户任务的总记录。当前项目中：一个 <code>task_id</code> 对应一个 Trace。</p></section>
+    <section class="panel"><h2>Span</h2><p>Trace 内的一段业务工作。当前项目中：一个 LangGraph 节点、一个搜索源调用或一个质量评价批次。</p></section>
+    <section class="panel"><h2>Generation</h2><p>一次 LLM 请求。它记录模型、Token、耗时、缓存和结果。它应位于发起 LLM 的节点 Span 内。</p></section>
+    <section class="panel"><h2>Loguru</h2><p>函数级诊断日志。它保存原始异常、文件、函数、行号和 traceback；Langfuse 不替代它。</p></section>
+    <section class="panel"><h2>关联键</h2><p><code>task_id</code> 连接 API、TaskCoordinator、LangGraph thread、Langfuse Trace 和 Loguru 日志。搜索和异步批次额外使用 <code>search_run_id</code>、<code>batch_id</code>。</p></section>
+  </main>
+</body>
+</html>
