@@ -1,0 +1,61 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+}
+
+* {
+  scrollbar-width: none;
+}
+*::-webkit-scrollbar {
+  display: none;
+}
+
+/* Sidebar chat list — thin frosted scrollbar */
+.sidebar-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0,0,0,0.12) transparent;
+}
+.sidebar-scroll::-webkit-scrollbar {
+  display: block;
+  width: 3px;
+}
+.sidebar-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0,0,0,0.10);
+  border-radius: 99px;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(0,0,0,0.20);
+}
+
+/* Liquid glass utility */
+.glass {
+  background: rgba(255, 255, 255, 0.62);
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.55);
+}
+.glass-dark {
+  background: rgba(255, 255, 255, 0.45);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid rgba(255, 255, 255, 0.50);
+}
+
+.wallpaper {
+  position: relative;
+  isolation: isolate;
+  background: #f8fafc;
+}
+.wallpaper::before {
+  content: ""; position: fixed; inset: -12%; z-index: -1; pointer-events: none;
+  background: radial-gradient(circle at 12% 18%, rgba(248,210,222,.32), transparent 32%), radial-gradient(circle at 84% 16%, rgba(207,225,248,.30), transparent 30%), radial-gradient(circle at 76% 78%, rgba(216,239,224,.26), transparent 32%), radial-gradient(circle at 22% 84%, rgba(249,235,190,.22), transparent 30%);
+  filter: blur(48px); opacity: .75;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

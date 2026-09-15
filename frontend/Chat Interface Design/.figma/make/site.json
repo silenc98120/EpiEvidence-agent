@@ -1,0 +1,10 @@
+{
+  "description": "Organizes chat history with summaries and enables users to create new tasks via a clean interface featuring text input and planned voice input support.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
