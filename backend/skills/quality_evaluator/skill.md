@@ -37,7 +37,7 @@ description: 对已标准化、去重并持久化的医学文献按 StudyType �
 | 字段、枚举、输出值域和完整性 | [`schema.py`](schema.py) |
 | `StudyType` 与 legacy `criterion_id` | [`rubric_registry.py`](rubric_registry.py) |
 | 统一问题、示例和研究类型映射 | [`references/quality-question-catalog.md`](references/quality-question-catalog.md) |
-| 文章级、核查级、集合级 Prompt | [`prompts/core_prompt.md`](prompts/core_prompt.md)、[`prompts/verification_prompt.md`](prompts/verification_prompt.md)、[`prompts/portfolio_evaluation_prompt.md`](prompts/portfolio_evaluation_prompt.md) |
+| 文章级、集合级 Prompt | [`prompts/core_prompt.md`](prompts/core_prompt.md)、[`prompts/portfolio_evaluation_prompt.md`](prompts/portfolio_evaluation_prompt.md) |
 | 分数重算、阈值和排序 | [`scoring.py`](scoring.py) |
 | hydrate、重试和阶段编排 | [`evaluator.py`](evaluator.py)、[`subgraph.py`](subgraph.py) |
 
@@ -86,20 +86,13 @@ description: 对已标准化、去重并持久化的医学文献按 StudyType �
 
 完成条件：成功结果通过 Pydantic 校验；失败结果明确、可诊断且不含伪造评分。
 
-### 5. 程序初算和逐项核查
+### 5. 程序评分
 
-模型不计算 `preliminary_quality`、综合分、筛选结果或排序。程序根据适用条目分值先计算原始质量与综合分。
+模型不计算 `preliminary_quality`、综合分、筛选结果或排序。程序直接根据已经通过
+Schema 校验的 Evaluator 条目计算质量与其他派生分，再按现有阈值进行筛选。生产链路
+不再执行第二次 Verifier LLM 调用；语义审查由离线 Eval 完成且不回写生产结果。
 
-随后使用 `verification_prompt.md` 输出符合 `VerificationBatch` 的核查结果，逐项检查：
-
-- `evidence_quote` 是否真实存在于声明来源；
-- `reason` 是否忠实解释原文；
-- 原证据是否足以支持 relevance、answerability 和每个质量状态；
-- `original_total_score` 是否保持原值。
-
-核查通过时保留原状态和分值；核查失败时输出 `original_*`、`corrected_*`、`issue` 和 `verification_evidence`。核查 Agent 不计算修正后综合分、不决定纳入状态、不修改原始记录。
-
-程序根据修正后的底层条目重算 `corrected_composite_score`：大于 `3` 保留，小于等于 `3` 排除。每个输入 UUID 必须恰好进入 retained 或 excluded 之一。
+每个输入 UUID 必须恰好进入 retained 或 excluded 之一。
 
 ### 6. 集合覆盖和排序
 
@@ -115,7 +108,7 @@ description: 对已标准化、去重并持久化的医学文献按 StudyType �
 程序按以下顺序稳定排序：
 
 1. `coverage_contribution_score` 降序；
-2. `corrected_composite_score` 降序；
+2. `composite_score` 降序；
 3. 发表日期降序，缺失日期置后；
 4. canonical UUID 升序。
 
@@ -216,7 +209,7 @@ LangGraph/worker 负责分组、切批、hydrate、调用、核查、程序重�
 - [ ] 输入是标准化、去重、持久化的同类型 UUID 批次，hydrate 后 UUID 集合完全匹配。
 - [ ] 当前 `study_type` 只使用注册表中的 Rubric 和 legacy `criterion_id`。
 - [ ] 每篇 relevance、answerability 和全部质量条目均有可追溯证据；缺失信息使用正确状态。
-- [ ] 文章级输出符合 `ArticleAssessmentBatch`，核查级输出符合 `VerificationBatch`，集合级输出符合 `PortfolioEvaluation`。
+- [ ] 文章级输出符合 `ArticleAssessmentBatch`，集合级输出符合 `PortfolioEvaluation`。
 - [ ] 综合分、核查后重算、阈值筛选和排序均由程序完成；模型未输出派生决策。
 - [ ] portfolio 只评价保留候选，未把未指定约束当作覆盖缺口，所有引用均属于候选集。
 - [ ] 失败批次没有伪造分数；成功批次才允许持久化和进入下游汇总。

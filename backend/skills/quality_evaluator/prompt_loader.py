@@ -11,7 +11,6 @@ from .rubric_registry import get_rubric
 from .schema import (
     PortfolioEvaluation,
     StudyType,
-    VerificationBatch,
     article_assessment_model_for,
 )
 
@@ -34,12 +33,6 @@ class QualityPromptLoader:
                     article_assessment_model_for(study_type)
                 ),
             },
-        )
-
-    def verification_prompt(self) -> str:
-        return self._render(
-            "verification_prompt.md",
-            {"__OUTPUT_SCHEMA__": self._schema_json(VerificationBatch)},
         )
 
     def portfolio_prompt(self) -> str:

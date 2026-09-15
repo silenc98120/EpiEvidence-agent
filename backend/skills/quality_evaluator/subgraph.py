@@ -12,16 +12,13 @@ from .schema import (
     PortfolioEvaluation,
     QualityEvaluationJob,
     StudyType,
-    VerificationBatch,
 )
 from .scoring import (
     ArticleScore,
     RankedCandidate,
-    calculate_composite_score,
-    calculate_preliminary_quality,
     partition_by_threshold,
     rank_candidates,
-    rescore_verified_article,
+    score_assessed_article,
 )
 
 
@@ -38,8 +35,7 @@ def neutral_metadata_signals(_article: EvaluationArticle) -> tuple[float, float]
 class GroupEvaluationResult:
     job: QualityEvaluationJob
     assessment: ArticleAssessmentBatch
-    verification: VerificationBatch
-    verified_scores: tuple[ArticleScore, ...]
+    scores: tuple[ArticleScore, ...]
     retained_article_ids: tuple[UUID, ...]
     excluded_article_ids: tuple[UUID, ...]
 
@@ -47,14 +43,12 @@ class GroupEvaluationResult:
         return {
             "job": self.job.model_dump(mode="json"),
             "assessment": self.assessment.model_dump(mode="json"),
-            "verification": self.verification.model_dump(mode="json"),
-            "verified_scores": [
+            "scores": [
                 {
                     **asdict(score),
                     "article_id": str(score.article_id),
-                    "verification_issues": list(score.verification_issues),
                 }
-                for score in self.verified_scores
+                for score in self.scores
             ],
             "retained_article_ids": [str(item) for item in self.retained_article_ids],
             "excluded_article_ids": [str(item) for item in self.excluded_article_ids],
@@ -65,8 +59,7 @@ class GroupEvaluationResult:
         return cls(
             job=QualityEvaluationJob.model_validate(payload["job"]),
             assessment=ArticleAssessmentBatch.model_validate(payload["assessment"]),
-            verification=VerificationBatch.model_validate(payload["verification"]),
-            verified_scores=tuple(
+            scores=tuple(
                 ArticleScore(
                     article_id=UUID(str(item["article_id"])),
                     relevance_score=float(item["relevance_score"]),
@@ -75,9 +68,8 @@ class GroupEvaluationResult:
                     journal_score=float(item["journal_score"]),
                     recency_score=float(item["recency_score"]),
                     composite_score=float(item["composite_score"]),
-                    verification_issues=tuple(item.get("verification_issues", [])),
                 )
-                for item in payload["verified_scores"]
+                for item in payload["scores"]
             ),
             retained_article_ids=tuple(
                 UUID(str(item)) for item in payload["retained_article_ids"]
@@ -115,11 +107,10 @@ class QualityEvaluationOutcome:
                 {
                     "article_id": str(item.article_id),
                     "coverage_contribution_score": item.coverage_contribution_score,
-                    "corrected_composite_score": item.corrected_composite_score,
+                    "composite_score": item.composite_score,
                     "publication_date": (
                         item.publication_date.isoformat() if item.publication_date else None
                     ),
-                    "verification_issues": list(item.score.verification_issues),
                 }
                 for item in self.ranked_candidates
             ],
@@ -129,7 +120,7 @@ class QualityEvaluationOutcome:
 
 
 class QualityEvaluationPipeline:
-    """顺序执行初筛、核查、重算，并在 fan-in 后执行集合评价。"""
+    """执行文章评价、程序评分，并在 fan-in 后执行集合评价。"""
 
     def __init__(
         self,
@@ -178,49 +169,26 @@ class QualityEvaluationPipeline:
         quality_by_id = {
             item.article_id: item for item in assessment.quality_assessments
         }
-        original_total_scores: dict[UUID, float] = {}
         metadata_scores: dict[UUID, tuple[float, float]] = {}
         for article_id in job.article_ids:
             journal_score, recency_score = self.metadata_signal_provider(
                 article_by_id[article_id]
             )
             metadata_scores[article_id] = (journal_score, recency_score)
-            quality_score = calculate_preliminary_quality(
-                item.score for item in quality_by_id[article_id].criteria
-            )
-            relevance = relevance_by_id[article_id]
-            original_total_scores[article_id] = calculate_composite_score(
-                relevance_score=relevance.score,
-                quality_score=quality_score,
-                answerability_score=relevance.answerability_score,
-                journal_score=journal_score,
-                recency_score=recency_score,
-            )
-
-        verification = await self.runtime.verify(
-            hydrated=hydrated,
-            original=assessment,
-            original_total_scores=original_total_scores,
-        )
-        verification_by_id = {
-            item.article_id: item for item in verification.article_verifications
-        }
-        verified_scores = tuple(
-            rescore_verified_article(
+        scores = tuple(
+            score_assessed_article(
                 relevance=relevance_by_id[article_id],
                 quality=quality_by_id[article_id],
-                verification=verification_by_id[article_id],
                 journal_score=metadata_scores[article_id][0],
                 recency_score=metadata_scores[article_id][1],
             )
             for article_id in job.article_ids
         )
-        decision = partition_by_threshold(verified_scores, threshold=self.threshold)
+        decision = partition_by_threshold(scores, threshold=self.threshold)
         return GroupEvaluationResult(
             job=job,
             assessment=assessment,
-            verification=verification,
-            verified_scores=verified_scores,
+            scores=scores,
             retained_article_ids=tuple(item.article_id for item in decision.retained),
             excluded_article_ids=tuple(item.article_id for item in decision.excluded),
         )
@@ -245,7 +213,7 @@ class QualityEvaluationPipeline:
         retained_scores = [
             score
             for group in groups
-            for score in group.verified_scores
+            for score in group.scores
             if score.article_id in set(group.retained_article_ids)
         ]
         if not retained_scores:
@@ -275,8 +243,7 @@ class QualityEvaluationPipeline:
                     {
                         **article.model_dump(mode="json"),
                         "study_type": group.job.study_type.value,
-                        "corrected_composite_score": score.composite_score,
-                        "verification_issues": list(score.verification_issues),
+                        "composite_score": score.composite_score,
                     }
                 )
                 publication_dates[article.article_id] = article.publication_date

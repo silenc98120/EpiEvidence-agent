@@ -54,11 +54,6 @@ class EvidenceSource(StrEnum):
     RUBRIC = "rubric"
 
 
-class VerificationStatus(StrEnum):
-    PASSED = "passed"
-    FAILED = "failed"
-
-
 class CoverageStatus(StrEnum):
     DIRECT = "direct"
     PARTIAL = "partial"
@@ -168,7 +163,7 @@ class QualityEvaluationJob(_StrictModel):
     task_id: str = Field(min_length=1)
     group_id: str = Field(min_length=1)
     study_type: StudyType
-    article_ids: list[UUID] = Field(min_length=1, max_length=10)
+    article_ids: list[UUID] = Field(min_length=1, max_length=5)
 
     @field_validator("article_ids")
     @classmethod
@@ -508,171 +503,6 @@ def article_assessment_model_for(
     )
     _ARTICLE_BATCH_MODEL_BY_STUDY_TYPE[study_type] = batch_model
     return batch_model
-
-
-def _expected_criterion_score(status: CriterionStatus) -> float | None:
-    return {
-        CriterionStatus.FAVORABLE: 1.0,
-        CriterionStatus.UNCLEAR: -0.5,
-        CriterionStatus.NOT_REPORTED: -1.0,
-        CriterionStatus.NOT_APPLICABLE: None,
-    }[status]
-
-
-def _expected_relevance_level(score: float) -> RelevanceLevel:
-    if score >= 8:
-        return RelevanceLevel.HIGH
-    if score >= 4:
-        return RelevanceLevel.PARTIAL
-    return RelevanceLevel.LOW
-
-
-class RelevanceVerificationItem(_StrictModel):
-    status: VerificationStatus
-    original_level: RelevanceLevel
-    original_score: float = Field(ge=0.0, le=10.0)
-    corrected_level: RelevanceLevel
-    corrected_score: float = Field(ge=0.0, le=10.0)
-    evidence_quote_valid: bool
-    reason_supported: bool
-    issue: str | None = None
-    verification_evidence: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def validate_verification(self) -> "RelevanceVerificationItem":
-        if self.original_level != _expected_relevance_level(self.original_score):
-            raise ValueError("原始相关性等级与分数不一致")
-        if self.corrected_level != _expected_relevance_level(self.corrected_score):
-            raise ValueError("修正相关性等级与分数不一致")
-        if self.status == VerificationStatus.PASSED:
-            if (
-                self.original_level != self.corrected_level
-                or self.original_score != self.corrected_score
-            ):
-                raise ValueError("passed 核查不得改变相关性评分")
-            if not self.evidence_quote_valid or not self.reason_supported:
-                raise ValueError("passed 核查必须确认引文和理由")
-            if self.issue is not None:
-                raise ValueError("passed 核查不能包含 issue")
-        elif not self.issue:
-            raise ValueError("failed 核查必须说明 issue")
-        return self
-
-
-class QualityVerificationItem(_StrictModel):
-    criterion_id: str = Field(min_length=1)
-    status: VerificationStatus
-    original_status: CriterionStatus
-    original_score: float | None
-    corrected_status: CriterionStatus
-    corrected_score: float | None
-    evidence_quote_valid: bool
-    reason_supported: bool
-    issue: str | None = None
-    verification_evidence: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def validate_verification(self) -> "QualityVerificationItem":
-        if self.original_score != _expected_criterion_score(self.original_status):
-            raise ValueError("原始质量状态对应的固定分值不正确")
-        if self.corrected_score != _expected_criterion_score(self.corrected_status):
-            raise ValueError("修正质量状态对应的固定分值不正确")
-        if (
-            self.corrected_status == CriterionStatus.NOT_REPORTED
-            and self.verification_evidence != "摘要未报告"
-        ):
-            raise ValueError("not_reported 的核查证据必须为“摘要未报告”")
-        if self.status == VerificationStatus.PASSED:
-            if (
-                self.original_status != self.corrected_status
-                or self.original_score != self.corrected_score
-            ):
-                raise ValueError("passed 核查不得改变质量评分")
-            if not self.evidence_quote_valid or not self.reason_supported:
-                raise ValueError("passed 核查必须确认引文和理由")
-            if self.issue is not None:
-                raise ValueError("passed 核查不能包含 issue")
-        elif not self.issue:
-            raise ValueError("failed 核查必须说明 issue")
-        return self
-
-
-class AnswerabilityVerificationItem(_StrictModel):
-    status: VerificationStatus
-    original_score: float = Field(ge=0.0, le=10.0)
-    corrected_score: float = Field(ge=0.0, le=10.0)
-    reason_supported: bool
-    issue: str | None = None
-    verification_evidence: str = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def validate_verification(self) -> "AnswerabilityVerificationItem":
-        if self.status == VerificationStatus.PASSED:
-            if self.original_score != self.corrected_score:
-                raise ValueError("passed 核查不得改变回答问题能力评分")
-            if not self.reason_supported:
-                raise ValueError("passed 核查必须确认回答问题能力理由")
-            if self.issue is not None:
-                raise ValueError("passed 核查不能包含 issue")
-        elif not self.issue:
-            raise ValueError("failed 核查必须说明 issue")
-        return self
-
-
-class ArticleVerification(_StrictModel):
-    article_id: UUID
-    original_total_score: float = Field(ge=0.0, le=10.0)
-    status: VerificationStatus
-    relevance: RelevanceVerificationItem
-    answerability: AnswerabilityVerificationItem
-    quality_items: list[QualityVerificationItem] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def validate_article_status(self) -> "ArticleVerification":
-        item_statuses = [
-            self.relevance.status,
-            self.answerability.status,
-            *(item.status for item in self.quality_items),
-        ]
-        expected = (
-            VerificationStatus.FAILED
-            if VerificationStatus.FAILED in item_statuses
-            else VerificationStatus.PASSED
-        )
-        if self.status != expected:
-            raise ValueError("文章核查状态必须与逐项核查结果一致")
-        criterion_ids = [item.criterion_id for item in self.quality_items]
-        if len(criterion_ids) != len(set(criterion_ids)):
-            raise ValueError("quality_items 的 criterion_id 不能重复")
-        return self
-
-
-class VerificationBatch(_StrictModel):
-    task_id: str = Field(min_length=1)
-    group_id: str = Field(min_length=1)
-    study_type: StudyType
-    article_ids: list[UUID] = Field(min_length=1, max_length=10)
-    article_verifications: list[ArticleVerification] = Field(min_length=1, max_length=10)
-
-    @model_validator(mode="after")
-    def validate_batch_alignment(self) -> "VerificationBatch":
-        expected_ids = self.article_ids
-        actual_ids = [item.article_id for item in self.article_verifications]
-        if (
-            len(expected_ids) != len(set(expected_ids))
-            or len(actual_ids) != len(set(actual_ids))
-            or set(actual_ids) != set(expected_ids)
-        ):
-            raise ValueError("article_verifications 必须完整覆盖 article_ids 且不能重复")
-
-        expected_criteria = {
-            criterion.value for criterion in CRITERION_ENUM_BY_STUDY_TYPE[self.study_type]
-        }
-        for article in self.article_verifications:
-            actual_criteria = {item.criterion_id for item in article.quality_items}
-            if actual_criteria != expected_criteria:
-                raise ValueError("核查项目必须完整覆盖当前研究类型 Rubric")
-        return self
 
 
 class CoverageAssessment(_StrictModel):

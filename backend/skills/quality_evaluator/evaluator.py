@@ -13,10 +13,8 @@ from pydantic import BaseModel
 from .prompt_loader import QualityPromptLoader
 from .schema import (
     ArticleAssessmentBatch,
-    HydratedArticleBatch,
     PortfolioEvaluation,
     QualityEvaluationJob,
-    VerificationBatch,
     article_assessment_model_for,
 )
 
@@ -67,43 +65,6 @@ class QualityEvaluatorRuntime:
             raise ValueError("文章级评价输出与输入 job 不一致")
         return result
 
-    async def verify(
-        self,
-        *,
-        hydrated: HydratedArticleBatch,
-        original: ArticleAssessmentBatch,
-        original_total_scores: Mapping[UUID, float],
-    ) -> VerificationBatch:
-        expected_ids = set(hydrated.job.article_ids)
-        if set(original.article_ids) != expected_ids:
-            raise ValueError("原始评价与数据库补全文章 UUID 不一致")
-        if set(original_total_scores) != expected_ids:
-            raise ValueError("original_total_scores 必须完整覆盖文章 UUID")
-        payload = {
-            "user_query": hydrated.user_query,
-            "articles": [article.model_dump(mode="json") for article in hydrated.articles],
-            "original_assessments": original.model_dump(mode="json"),
-            "original_total_scores": {
-                str(article_id): score for article_id, score in original_total_scores.items()
-            },
-        }
-        result = await self._invoke(
-            system_prompt=self.prompt_loader.verification_prompt(),
-            payload=payload,
-            output_model=VerificationBatch,
-        )
-        if (
-            result.task_id != original.task_id
-            or result.group_id != original.group_id
-            or result.study_type != original.study_type
-            or set(result.article_ids) != expected_ids
-        ):
-            raise ValueError("核查输出与原始评价 batch 不一致")
-        for article in result.article_verifications:
-            if article.original_total_score != original_total_scores[article.article_id]:
-                raise ValueError("核查输出不得改写 original_total_score")
-        return result
-
     async def evaluate_portfolio(
         self,
         *,
@@ -152,6 +113,10 @@ class QualityEvaluatorRuntime:
         for _attempt in range(self.max_attempts):
             try:
                 response = await runnable.ainvoke(messages)
+                if isinstance(response, BaseModel) and not isinstance(
+                    response, output_model
+                ):
+                    response = response.model_dump(mode="json")
                 return (
                     response
                     if isinstance(response, output_model)
