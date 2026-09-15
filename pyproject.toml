@@ -1,7 +1,7 @@
 [project]
 name = "epi-research-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI-powered epidemiology research agent using LangGraph and LLMs."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -23,6 +23,9 @@ dependencies = [
     "celery-types>=0.26.0",
     "alembic>=1.19.2",
     "langfuse>=4.15.2",
+    "numpy>=2.0",
+    "pyyaml>=6.0",
+    "sentence-transformers>=5.0",
 ]
 
 [dependency-groups]
@@ -32,4 +35,3 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
-
