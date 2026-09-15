@@ -17,6 +17,7 @@ from backend.app.api.schemas import (
     TaskListResponse,
     TaskResponse,
     TaskStatus,
+    ConversationCreateRequest, ConversationRenameRequest, ConversationListResponse, ConversationResponse,
 )
 from backend.app.api.services.agui_events import run_error, run_finished, state_snapshot
 from backend.app.api.services.event_broker import EventBroker
@@ -25,14 +26,42 @@ from backend.app.api.services.task_coordinator import (
     TaskPersistenceUnavailable,
 )
 from backend.app.api.services.task_store import TaskStore
+from backend.app.api.services.conversation_store import ConversationStore
 
 
 def create_router(
     store: TaskStore,
     coordinator: TaskCoordinator,
     broker: EventBroker,
+    conversations = None,
 ) -> APIRouter:
     router = APIRouter()
+    conversations = conversations or ConversationStore()
+
+    @router.post("/api/conversations", response_model=ConversationResponse)
+    async def create_conversation(request: ConversationCreateRequest):
+        return await conversations.create(request.title)
+
+    @router.get("/api/conversations", response_model=ConversationListResponse)
+    async def list_conversations():
+        return ConversationListResponse(items=await conversations.list())
+
+    @router.get("/api/conversations/{conversation_id}", response_model=ConversationResponse)
+    async def get_conversation(conversation_id: UUID):
+        item = await conversations.get(conversation_id)
+        if item is None: raise HTTPException(404, "会话不存在")
+        return item
+
+    @router.patch("/api/conversations/{conversation_id}", response_model=ConversationResponse)
+    async def rename_conversation(conversation_id: UUID, request: ConversationRenameRequest):
+        if not await conversations.rename(conversation_id, request.title):
+            raise HTTPException(404, "会话不存在")
+        return await conversations.get(conversation_id)
+
+    @router.delete("/api/conversations/{conversation_id}", status_code=204)
+    async def delete_conversation(conversation_id: UUID):
+        if not await conversations.delete(conversation_id):
+            raise HTTPException(404, "会话不存在")
 
     @router.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -49,9 +78,13 @@ def create_router(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="研究任务存储暂不可用，请稍后重试",
             ) from exc
+        if task.conversation_id:
+            await conversations.append(task.conversation_id, "user", task.query, task.task_id)
+            await conversations.update_status(task.conversation_id, "running", TaskStatus.RUNNING)
         return TaskAcceptedResponse(
             task_id=task.task_id,
             events_url=f"/api/tasks/{task.task_id}/events",
+            conversation_id=task.conversation_id,
         )
 
     @router.get("/api/tasks", response_model=TaskListResponse)

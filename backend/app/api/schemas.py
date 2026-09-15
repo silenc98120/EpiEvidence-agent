@@ -123,6 +123,7 @@ class TaskAcceptedResponse(BaseModel):
     task_id: UUID
     status: TaskStatus = TaskStatus.CREATED
     events_url: str
+    conversation_id: UUID | None = None
 
 
 class TaskResponse(BaseModel):
@@ -159,6 +160,36 @@ class TaskListResponse(BaseModel):
     """
 
     items: list[TaskResponse] = Field(default_factory=list)
+
+class ConversationCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+class ConversationRenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+
+class ConversationMessageResponse(BaseModel):
+    message_id: UUID
+    conversation_id: UUID
+    task_id: UUID | None = None
+    role: Literal["user", "assistant", "system"]
+    content: str
+    status: Literal["streaming", "completed", "failed"] = "completed"
+    sequence_no: int
+    created_at: datetime
+
+class ConversationListItem(BaseModel):
+    conversation_id: UUID
+    title: str
+    preview: str | None = None
+    status: str
+    updated_at: datetime
+    latest_task_status: TaskStatus | None = None
+
+class ConversationResponse(ConversationListItem):
+    messages: list[ConversationMessageResponse] = Field(default_factory=list)
+
+class ConversationListResponse(BaseModel):
+    items: list[ConversationListItem] = Field(default_factory=list)
 
 
 class TaskEventType(StrEnum):
