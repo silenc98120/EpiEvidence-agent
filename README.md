@@ -14,7 +14,7 @@
 - 将异构题录统一为同一数据契约，并根据 DOI、PMID、PMCID 或题名组合进行保守去重。
 - 将检索事实写入 PostgreSQL，仅在 LangGraph State 和 Redis 中传递任务决策与文章 ID。
 - 在进入 LLM 评价前，综合关键词、embedding 相似度和时效性筛选候选文献。
-- 按研究设计选择 rubric，每篇一次质量评价；共享请求并发、严格校验、程序评分与集合覆盖排序。
+- 按研究设计选择 rubric，每篇调用一次模型完成质量初筛；使用 LangChain structured output 与研究类型专属 Pydantic Schema，程序校验 span 引用、重算评分，再以独立受限请求执行集合覆盖评价。
 - 由 Evidence Summarizer 自主选择值得推荐的文献数量，生成普通中文聊天回复。
 - FastAPI 提供任务生命周期接口，并以 AG-UI 风格事件通过 SSE 推送运行阶段和最终文本。
 - 使用 PostgreSQL LangGraph checkpoint 支持稳定的 `thread_id` 与任务恢复；使用 Langfuse 记录主任务、节点和模型调用 traces。
@@ -61,7 +61,7 @@ POST /api/tasks
 | 任务执行 | LangGraph Send 子图；单篇调度，共享模型请求名额，PostgreSQL 保存恢复输入与结果 |
 | 事实存储 | PostgreSQL + SQLAlchemy 2.0 + Alembic；任务、检索、文献、质量结果 |
 | 工作缓存 | Redis；短期状态、小型决策结果和文章 ID 索引 |
-| 术语索引 | SQLite；本地 MeSH preferred term 与 entry terms 查询 |
+| 术语索引 | 仓库内 SQLite；本地 MeSH preferred term 与 entry terms 查询 |
 | 可观测性 | Langfuse + Loguru；trace、节点指标、模型调用与运行日志 |
 
 ## 项目结构
@@ -90,7 +90,7 @@ tests/                            按模块与纵向闭环组织的测试
 
 ### 1. 准备环境
 
-需要 Python 3.11+、[uv](https://docs.astral.sh/uv/)、PostgreSQL、Redis，以及可用的 OpenAI-compatible LLM 与 embedding API。
+需要 Python 3.11+、[uv](https://docs.astral.sh/uv/)、PostgreSQL、Redis、可用的 OpenAI-compatible LLM，以及 embedding 服务。Embedding 可使用 OpenAI-compatible API，也可通过 `BGE_M3_MODEL_PATH` 加载本地 BGE-M3 模型。
 
 ```powershell
 uv sync
@@ -107,6 +107,7 @@ LLM_API_KEY=your-api-key
 LLM_TEMPERATURE=0.0
 LLM_TIMEOUT_SECONDS=120
 
+# 远程 embedding API；若使用本地 BGE-M3，则配置 BGE_M3_MODEL_PATH 代替这三项
 EMBEDDING_MODEL=your-embedding-model
 EMBEDDING_API_KEY=your-embedding-api-key
 EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
@@ -130,16 +131,16 @@ LANGFUSE_TRACING_ENVIRONMENT=local
 
 真实密钥只应保存在 `.env`；该文件已被 `.gitignore` 排除。
 
-### 2. 构建 MeSH 索引
+### 2. MeSH 索引
 
-将 `MESH.csv.gz` 放到仓库根目录的 `data/`。脚本直接读取 gzip，无需手动解压：
+仓库已包含 `backend/data/mesh.sqlite3`，默认可以直接使用。若要从新版 MeSH 源文件重建索引，将 `MESH.csv.gz` 放到仓库根目录的 `data/` 后运行：
 
 ```powershell
 uv run python scripts/build_mesh_index.py
 Copy-Item data/mesh.sqlite3 backend/data/mesh.sqlite3
 ```
 
-建库脚本当前生成 `data/mesh.sqlite3`，而默认研究图读取 `backend/data/mesh.sqlite3`，因此现阶段需要执行上面的复制命令。后续应统一这两个路径。
+建库脚本当前生成 `data/mesh.sqlite3`，而默认研究图读取 `backend/data/mesh.sqlite3`，因此重建后需要执行上面的复制命令。
 
 ### 3. 初始化 PostgreSQL
 
@@ -208,22 +209,25 @@ uv run python scripts/verify_langfuse.py
 ```dotenv
 QUALITY_BATCH_SIZE=1
 QUALITY_EXPERT_CONCURRENCY=5
+QUALITY_PORTFOLIO_CONCURRENCY=1
+QUALITY_PORTFOLIO_DEADLINE_SECONDS=90
+QUALITY_CANDIDATE_LIMIT=20
 ```
 
-一个 Job 固定只评一篇文章。并发值限制同一应用图中、所有研究任务合计的在途质量评估模型请求；同类型文章也能用满 5 个名额。等待请求按研究类型轮转，其他类型处理结束后名额立即复用。此设置适用于单 API 进程；多个 API 进程分别拥有自己的上限。
+质量评估固定每个 Job 处理一篇文章。`QUALITY_EXPERT_CONCURRENCY` 限制单个 API 进程内文章级请求的并发数，同类型文章也可以使用全部名额；等待请求按研究类型轮转。集合评价有独立的并发和 deadline 配置，不占用文章级并发槽。多个 API 进程分别应用自己的并发上限。
 
-每次模型调用都携带固定 skill prompt、当前类型完整 JSON Schema、研究问题和本篇摘要。prompt 在本地缓存；后续请求不依赖模型记住前一篇内容。初次请求和重试共用最多 2 次尝试、每个 Job 240 秒总 deadline；退避时释放名额，SDK 不再叠加重试。
+文章级请求由 `function_calling` structured output 绑定当前研究类型的 Pydantic Schema；Schema 不作为普通文本放入 prompt。请求包含固定评估 prompt、专属 rubric、研究问题及单篇题名、摘要和可追溯 span。集合评价也通过 structured output 返回覆盖结论、文章贡献和 span ID，随后由程序验证 span 并还原原文。文章级 Job 最多尝试 2 次、总 deadline 为 240 秒；退避时释放并发槽。
 
 计划分发前将输入快照写入 PostgreSQL。领取成功才能评估，完成写入核对 attempt token 与有效租约。`POST /api/tasks/{task_id}/resume` 沿原 checkpoint 恢复，已完成文章直接复用，过期租约才允许重新领取。进程重启后也可按原任务 ID 查询和恢复。
 
-`GET /api/tasks/{task_id}` 的 `quality_progress` 和 SSE `CUSTOM` 事件（`name=quality_progress`）包含 planned、pending、processing、completed、failed、cancelled 计数。每篇记录 hydrate、等待名额、模型、校验、计分、持久化与重试指标；最终结果的 `quality_evaluation_failures` 显式列出漏评与集合降级。
+`GET /api/tasks/{task_id}` 的 `quality_progress` 和 SSE `CUSTOM` 事件（`name=quality_progress`）包含 planned、pending、processing、completed、failed、cancelled 计数。批次记录 hydrate、并发等待、模型耗时、输入/输出 token、校验、计分、持久化与重试指标；最终结果的 `quality_evaluation_failures` 显式列出漏评与集合降级。
 
 阈值筛选后先执行集合覆盖评价，正常按贡献分、综合分与日期排序，再限制候选窗口。集合评价失败时按单篇综合分排序，贡献分为 `null`，没有完成文章评价的文献不会获得默认分数。
 
-可复用本地 RCT 摘要进行真实接口测量（会调用已配置模型）：
+可使用数据库中最近更新的 RCT 摘要运行真实质量子图 benchmark（会创建 PostgreSQL 任务并调用已配置模型 API）：
 
 ```powershell
 .\.venv\Scripts\python.exe scripts/benchmark_quality_evaluation.py --limit 5 --concurrency 5
 ```
 
-报告写入 `artifacts/quality-benchmarks/`。脚本保留本次独立测试任务的输入与批次记录，便于检查耗时及复用结果。
+报告写入 `artifacts/quality-benchmarks/`。运行前需要启动 PostgreSQL，配置业务库与 checkpoint 数据库，以及评估模型 API；Redis 由工作缓存使用。该脚本会产生真实模型调用费用，不属于离线测试。

@@ -34,6 +34,10 @@ tests/
 lessons/
 assets/
 learning-records/
+scripts/generate_excalidraw.py
+scripts/generate_diagram1.py
+scripts/generate_diagram2.py
+scripts/generate_diagram3.py
 AGENTS.md
 MISSION.md
 NOTES.md
