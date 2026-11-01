@@ -24,6 +24,26 @@ class ResearchTaskRepository:
     ) -> None:
         self._session_factory = session_factory
 
+    async def get(self, task_id: UUID):
+        """进程重启后从事实表重建公共快照。运行中任务需显式恢复。"""
+        from backend.app.api.schemas import TaskResponse, TaskStatus, TaskStage, TaskError
+        from backend.app.api.services.output_adapter import build_public_result
+        async with self._session_factory() as session:
+            row = await session.get(TaskORM, task_id)
+            if row is None:
+                return None
+            terminal = row.status in {"completed", "failed", "cancelled"}
+            status = TaskStatus(row.status) if terminal else TaskStatus.FAILED
+            result = None
+            if row.final_summary:
+                result = build_public_result({"task_id": str(task_id), "user_query": row.user_query,
+                    "final_summary": row.final_summary}).model_dump(mode="json")
+            return TaskResponse(task_id=task_id, conversation_id=row.conversation_id,
+                query=row.user_query, status=status, stage=TaskStage(status.value), result=result,
+                error=TaskError(code=row.error_type or "process_interrupted", message="任务执行中断，可从检查点恢复", retryable=True)
+                    if status == TaskStatus.FAILED else None,
+                created_at=row.created_at, updated_at=row.updated_at)
+
     async def ensure_task(
         self,
         *,

@@ -93,14 +93,14 @@ def create_router(
 
     @router.get("/api/tasks/{task_id}", response_model=TaskResponse)
     async def get_task(task_id: UUID) -> TaskResponse:
-        task = await store.get(task_id)
+        task = await coordinator.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         return task
 
     @router.post("/api/tasks/{task_id}/cancel", response_model=TaskResponse)
     async def cancel_task(task_id: UUID) -> TaskResponse:
-        task = await store.get(task_id)
+        task = await coordinator.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         await coordinator.cancel(task_id)
@@ -108,7 +108,7 @@ def create_router(
 
     @router.post("/api/tasks/{task_id}/resume", response_model=TaskResponse)
     async def resume_task(task_id: UUID) -> TaskResponse:
-        task = await store.get(task_id)
+        task = await coordinator.get_task(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         if task.status not in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
@@ -120,11 +120,11 @@ def create_router(
 
     @router.get("/api/tasks/{task_id}/events")
     async def task_events(task_id: UUID, request: Request) -> StreamingResponse:
-        if await store.get(task_id) is None:
+        if await coordinator.get_task(task_id) is None:
             raise HTTPException(status_code=404, detail="任务不存在")
 
         async def stream() -> AsyncIterator[str]:
-            task = await store.get(task_id)
+            task = await coordinator.get_task(task_id)
             if task is None:
                 return
             initial_event = state_snapshot(task)

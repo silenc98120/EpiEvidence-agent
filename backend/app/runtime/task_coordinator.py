@@ -11,7 +11,7 @@ from langfuse import Langfuse,propagate_attributes
 from loguru import logger
 
 from backend.app.db.repositories import TaskPersistenceUnavailable
-from backend.app.api.schemas import TaskError, TaskStage, TaskStatus
+from backend.app.api.schemas import TaskError, TaskStage, TaskStatus, AGUIEvent, AGUIEventType
 from backend.app.api.schemas import PublicResearchResult
 from backend.app.core.intent_recognizer import IntentCategory, IntentRecognizer
 from backend.app.api.services.agui_events import (
@@ -34,6 +34,8 @@ from backend.app.api.services.task_store import TaskStore
 
 class TaskPersistence(Protocol):
     """TaskCoordinator 需要的最小持久化任务契约。"""
+
+    async def get(self, task_id: UUID) -> Any: ...
 
     async def ensure_task(
         self,
@@ -65,6 +67,7 @@ class TaskCoordinator:
             intent_recognizer: IntentRecognizer | None = None,
             simple_chat_responder: Any | None = None,
             conversation_store: Any | None = None,
+            quality_repository: Any | None = None,
     ) -> None:
         self._graph = graph
         self._store = store
@@ -74,6 +77,7 @@ class TaskCoordinator:
         self._intent_recognizer = intent_recognizer
         self._simple_chat_responder = simple_chat_responder
         self._conversation_store = conversation_store
+        self._quality_repository = quality_repository
         self._running: dict[UUID, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
 
@@ -83,6 +87,16 @@ class TaskCoordinator:
         if self._running:
             raise RuntimeError("运行中的任务存在时不能替换 LangGraph")
         self._graph = graph
+
+    async def get_task(self, task_id: UUID):
+        task = await self._store.get(task_id)
+        if task is None and self._task_persistence is not None:
+            task = await self._task_persistence.get(task_id)
+            if task is not None:
+                if self._quality_repository is not None:
+                    task = task.model_copy(update={"quality_progress": await self._quality_repository.latest_progress(str(task_id))})
+                await self._store.restore(task)
+        return task
 
     async def start(
         self,
@@ -118,6 +132,9 @@ class TaskCoordinator:
             if task_id in self._running:
                 return False
             await self._prepare_persistent_task(task_id, query, conversation_id)
+            if self._quality_repository is not None:
+                await self._quality_repository.resume_cancelled(str(task_id))
+            await self._store.update(task_id, status=TaskStatus.RUNNING)
             task = asyncio.create_task(
                 self.run(task_id, query, conversation_id, resume=True)
             )
@@ -180,7 +197,7 @@ class TaskCoordinator:
 
         await self._broker.publish(run_started(task_id, query))
         await self._conversation_status(conversation_id, "running")
-        if self._intent_recognizer is not None:
+        if self._intent_recognizer is not None and not resume:
             try:
                 intent = await self._intent_recognizer.recognize(query)
             except Exception:
@@ -227,12 +244,19 @@ class TaskCoordinator:
         config = {"configurable": {"thread_id": str(task_id)}}
         graph_input: Any = None if resume else state
         try:
-            async for snapshot in self._graph.astream(
+            async for namespace, mode, snapshot in self._graph.astream(
                 graph_input,
                 config=config,
-                stream_mode="values",
+                stream_mode=["values", "custom"],
+                subgraphs=True,
             ):
-                if not isinstance(snapshot, Mapping):
+                if mode == "custom":
+                    if isinstance(snapshot, Mapping) and snapshot.get("type") == "quality_progress":
+                        await self._store.update(task_id, quality_progress=dict(snapshot))
+                        await self._broker.publish(AGUIEvent(type=AGUIEventType.CUSTOM, task_id=task_id,
+                            name="quality_progress", value=dict(snapshot)))
+                    continue
+                if namespace or not isinstance(snapshot, Mapping):
                     continue
                 state = dict(snapshot)
                 stage_name = str(state.get("task_stage", previous_stage))
@@ -292,6 +316,7 @@ class TaskCoordinator:
 
             raise
         except Exception:
+            logger.exception("研究任务执行失败: task_id={}", task_id)
             await self._fail(
                 task_id,
                 "task_execution_failed",
@@ -342,11 +367,15 @@ class TaskCoordinator:
         task = self._running.get(task_id)
         if task is None:
             return False
+        if self._quality_repository is not None:
+            await self._quality_repository.cancel_task(str(task_id))
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+        if self._quality_repository is not None:
+            await self._store.update(task_id, quality_progress=await self._quality_repository.latest_progress(str(task_id)))
         return True
 
     @staticmethod
@@ -372,10 +401,7 @@ class TaskCoordinator:
             "search_metrics": {},
             "article_groups": {},
             "quality_groups": [],
-            "quality_evaluation_results": [],
             "quality_evaluation_failures": [],
-            "evaluated_evidence": [],
-            "scored_assessments": [],
             "excluded_candidates": [],
             "retained_candidates": [],
             "portfolio_evaluation": None,

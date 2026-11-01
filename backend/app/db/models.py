@@ -242,6 +242,8 @@ class ArticleORM(Base):
     title: Mapped[str] = mapped_column(Text, nullable=False)
     normalized_title: Mapped[str] = mapped_column(Text, nullable=False)
     abstract: Mapped[str | None] = mapped_column(Text)
+    evidence_spans: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    evidence_span_version: Mapped[str | None] = mapped_column(Text)
     abstract_available: Mapped[bool | None] = mapped_column(
         Boolean,
         Computed(
@@ -471,7 +473,11 @@ class QualityEvaluationBatchORM(Base):
     batch_id: Mapped[str] = mapped_column(Text, nullable=False)
     group_id: Mapped[str] = mapped_column(Text, nullable=False)
     study_type: Mapped[str] = mapped_column(Text, nullable=False)
-    celery_task_id: Mapped[str | None] = mapped_column(Text)
+    execution_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    attempt_id: Mapped[UUID | None] = mapped_column(PG_UUID(as_uuid=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    input_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    metrics_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     status: Mapped[str] = mapped_column(
         Text,
         nullable=False,
@@ -525,7 +531,7 @@ class QualityEvaluationBatchORM(Base):
             name="uq_quality_evaluation_batches_task_batch",
         ),
         CheckConstraint(
-            "status IN ('pending', 'processing', 'completed', 'failed')",
+            "status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')",
             name="ck_quality_evaluation_batches_status",
         ),
         CheckConstraint(
@@ -553,6 +559,7 @@ class QualityEvaluationBatchORM(Base):
             "task_id",
             "status",
         ),
+        Index("ix_quality_batches_execution", "task_id", "execution_id"),
     )
 
 class FullTextResourceORM(Base):

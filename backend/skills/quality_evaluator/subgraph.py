@@ -9,15 +9,13 @@ from uuid import UUID
 from .schema import (
     ArticleAssessmentBatch,
     EvaluationArticle,
-    PortfolioEvaluation,
     QualityEvaluationJob,
+    HydratedArticleBatch,
     StudyType,
 )
 from .scoring import (
     ArticleScore,
-    RankedCandidate,
     partition_by_threshold,
-    rank_candidates,
     score_assessed_article,
 )
 
@@ -38,9 +36,11 @@ class GroupEvaluationResult:
     scores: tuple[ArticleScore, ...]
     retained_article_ids: tuple[UUID, ...]
     excluded_article_ids: tuple[UUID, ...]
+    articles: tuple[EvaluationArticle, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "articles": [a.model_dump(mode="json") for a in self.articles],
             "job": self.job.model_dump(mode="json"),
             "assessment": self.assessment.model_dump(mode="json"),
             "scores": [
@@ -57,6 +57,7 @@ class GroupEvaluationResult:
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "GroupEvaluationResult":
         return cls(
+            articles=tuple(EvaluationArticle.model_validate(a) for a in payload.get("articles", [])),
             job=QualityEvaluationJob.model_validate(payload["job"]),
             assessment=ArticleAssessmentBatch.model_validate(payload["assessment"]),
             scores=tuple(
@@ -80,188 +81,21 @@ class GroupEvaluationResult:
         )
 
 
-@dataclass(frozen=True)
-class QualityEvaluationOutcome:
-    group_results: tuple[GroupEvaluationResult, ...]
-    portfolio: PortfolioEvaluation | None
-    ranked_candidates: tuple[RankedCandidate, ...]
-
-    @property
-    def retained_article_ids(self) -> tuple[UUID, ...]:
-        return tuple(item.article_id for item in self.ranked_candidates)
-
-    @property
-    def excluded_article_ids(self) -> tuple[UUID, ...]:
-        return tuple(
-            article_id
-            for group in self.group_results
-            for article_id in group.excluded_article_ids
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "portfolio_evaluation": (
-                self.portfolio.model_dump(mode="json") if self.portfolio else None
-            ),
-            "ranked_candidates": [
-                {
-                    "article_id": str(item.article_id),
-                    "coverage_contribution_score": item.coverage_contribution_score,
-                    "composite_score": item.composite_score,
-                    "publication_date": (
-                        item.publication_date.isoformat() if item.publication_date else None
-                    ),
-                }
-                for item in self.ranked_candidates
-            ],
-            "retained_candidate_ids": [str(item) for item in self.retained_article_ids],
-            "excluded_candidate_ids": [str(item) for item in self.excluded_article_ids],
-        }
-
-
-class QualityEvaluationPipeline:
-    """执行文章评价、程序评分，并在 fan-in 后执行集合评价。"""
-
-    def __init__(
-        self,
-        *,
-        runtime: Any,
-        metadata_signal_provider: MetadataSignalProvider | None = None,
-        threshold: float = 3.0,
-    ) -> None:
-        self.runtime = runtime
-        self.metadata_signal_provider = (
-            metadata_signal_provider or neutral_metadata_signals
-        )
-        self.threshold = threshold
-
-    async def evaluate_branch(self, branch: Mapping[str, Any]) -> GroupEvaluationResult:
-        group = dict(branch["quality_group"])
-        raw_ids = group.get("article_ids", [])
-        try:
-            article_ids = [UUID(str(article_id)) for article_id in raw_ids]
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "Quality Evaluator 只接受 PostgreSQL articles.article_id canonical UUID"
-            ) from exc
-        try:
-            study_type = StudyType(group["study_design"])
-        except (KeyError, ValueError) as exc:
-            raise ValueError("quality_group.study_design 不是受支持的 StudyType") from exc
-        job = QualityEvaluationJob(
-            task_id=str(branch["task_id"]),
-            group_id=str(group["group_id"]),
-            study_type=study_type,
-            article_ids=article_ids,
-        )
-        user_query = str(branch.get("user_query", "")).strip()
-        assessment = await self.runtime.evaluate(
-            job,
-            user_query=user_query,
-            intent_analysis=branch.get("intent_analysis", {}),
-            search_plan=branch.get("search_plan", {}),
-        )
-        hydrated = await self.runtime.repository.hydrate(job, user_query=user_query)
-        article_by_id = {article.article_id: article for article in hydrated.articles}
-        relevance_by_id = {
-            item.article_id: item for item in assessment.relevance_assessments
-        }
-        quality_by_id = {
-            item.article_id: item for item in assessment.quality_assessments
-        }
-        metadata_scores: dict[UUID, tuple[float, float]] = {}
-        for article_id in job.article_ids:
-            journal_score, recency_score = self.metadata_signal_provider(
-                article_by_id[article_id]
-            )
-            metadata_scores[article_id] = (journal_score, recency_score)
-        scores = tuple(
-            score_assessed_article(
-                relevance=relevance_by_id[article_id],
-                quality=quality_by_id[article_id],
-                journal_score=metadata_scores[article_id][0],
-                recency_score=metadata_scores[article_id][1],
-            )
-            for article_id in job.article_ids
-        )
-        decision = partition_by_threshold(scores, threshold=self.threshold)
-        return GroupEvaluationResult(
-            job=job,
-            assessment=assessment,
-            scores=scores,
-            retained_article_ids=tuple(item.article_id for item in decision.retained),
-            excluded_article_ids=tuple(item.article_id for item in decision.excluded),
-        )
-
-    async def finalize(
-        self,
-        *,
-        task_id: str,
-        user_query: str,
-        intent_analysis: Mapping[str, Any],
-        search_plan: Mapping[str, Any],
-        group_results: Sequence[GroupEvaluationResult | Mapping[str, Any]],
-    ) -> QualityEvaluationOutcome:
-        groups = tuple(
-            item
-            if isinstance(item, GroupEvaluationResult)
-            else GroupEvaluationResult.from_dict(item)
-            for item in group_results
-        )
-        if any(group.job.task_id != task_id for group in groups):
-            raise ValueError("group_results 包含其他 task_id")
-        retained_scores = [
-            score
-            for group in groups
-            for score in group.scores
-            if score.article_id in set(group.retained_article_ids)
-        ]
-        if not retained_scores:
-            return QualityEvaluationOutcome(
-                group_results=groups,
-                portfolio=None,
-                ranked_candidates=(),
-            )
-
-        retained_ids = {score.article_id for score in retained_scores}
-        candidate_articles: list[dict[str, Any]] = []
-        publication_dates: dict[UUID, Any] = {}
-        score_by_id = {score.article_id: score for score in retained_scores}
-        for group in groups:
-            group_retained = retained_ids.intersection(group.job.article_ids)
-            if not group_retained:
-                continue
-            hydrated = await self.runtime.repository.hydrate(
-                group.job,
-                user_query=user_query,
-            )
-            for article in hydrated.articles:
-                if article.article_id not in group_retained:
-                    continue
-                score = score_by_id[article.article_id]
-                candidate_articles.append(
-                    {
-                        **article.model_dump(mode="json"),
-                        "study_type": group.job.study_type.value,
-                        "composite_score": score.composite_score,
-                    }
-                )
-                publication_dates[article.article_id] = article.publication_date
-
-        portfolio = await self.runtime.evaluate_portfolio(
-            task_id=task_id,
-            user_query=user_query,
-            intent_analysis=intent_analysis,
-            search_plan=search_plan,
-            candidate_articles=candidate_articles,
-        )
-        ranked = rank_candidates(
-            retained_scores,
-            portfolio.article_contributions,
-            publication_dates=publication_dates,
-        )
-        return QualityEvaluationOutcome(
-            group_results=groups,
-            portfolio=portfolio,
-            ranked_candidates=ranked,
-        )
+def score_batch(batch: HydratedArticleBatch, assessment: ArticleAssessmentBatch, *,
+                metadata_signal_provider: MetadataSignalProvider = neutral_metadata_signals,
+                threshold: float = 3.0) -> GroupEvaluationResult:
+    """两条执行入口共享同一确定性评分规则，并携带已经读取的文章快照。"""
+    relevance = {a.article_id: a for a in assessment.relevance_assessments}
+    quality = {a.article_id: a for a in assessment.quality_assessments}
+    expected = set(batch.job.article_ids)
+    if set(relevance) != expected or set(quality) != expected:
+        raise ValueError("评分要求全部文章具有完整评价")
+    scores = tuple(score_assessed_article(
+        relevance=relevance[a.article_id], quality=quality[a.article_id],
+        journal_score=signals[0], recency_score=signals[1])
+        for a in batch.articles for signals in [metadata_signal_provider(a)])
+    decision = partition_by_threshold(scores, threshold=threshold)
+    return GroupEvaluationResult(job=batch.job, assessment=assessment, scores=scores,
+        retained_article_ids=tuple(s.article_id for s in decision.retained),
+        excluded_article_ids=tuple(s.article_id for s in decision.excluded),
+        articles=tuple(batch.articles))

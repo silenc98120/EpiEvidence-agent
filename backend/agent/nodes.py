@@ -10,17 +10,10 @@ from uuid import uuid4
 
 from langchain_core.messages import AIMessage
 from langgraph.types import Send
-from langgraph.graph import END
 from loguru import logger
-from pydantic import BaseModel
 
 from backend.agent.state import EvidenceState
-from backend.agent.subgraphs.quality_evaluation import (
-    group_quality_articles,
-    record_article_id,
-    split_quality_batch,
-    study_group_id,
-)
+from backend.agent.subgraphs.quality_evaluation import record_article_id, study_group_id
 from backend.agent.summarizer import render_summary_chat
 from backend.app.cache import RedisWorkCache
 from backend.app.core.deduplicator import Deduplicator
@@ -56,7 +49,6 @@ from backend.skills.quality_evaluator.schema import StudyType
 RequestFactory = Callable[[CompiledSearchQuery, str], Any]
 SearchCallable = Callable[[Any], Any | Awaitable[Any]]
 RawResultPersister = Callable[[SearchSource, str, Any], Any | Awaitable[Any]]
-QualityEvaluatorCallable = Callable[[dict[str, Any]], Any | Awaitable[Any]]
 EmbeddingClientFactory = Callable[[], EmbeddingClient]
 
 
@@ -118,21 +110,6 @@ def _search_branch_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
         "latency_ms": branch.get("latency_ms"),
         "normalization_latency_ms": branch.get("normalization_latency_ms"),
         "error_type": error.get("error_type") if isinstance(error, Mapping) else None,
-    }
-
-
-def _quality_branch_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
-    evaluations = result.get("quality_evaluation_results", [])
-    if not isinstance(evaluations, list) or not evaluations:
-        return {"evaluation_status": "missing_evaluation"}
-    evaluation = evaluations[0]
-    if not isinstance(evaluation, Mapping):
-        return {"evaluation_status": "invalid_evaluation"}
-    payload = evaluation.get("evaluation", {})
-    return {
-        "evaluation_status": payload.get("status") if isinstance(payload, Mapping) else None,
-        "group_id": evaluation.get("group_id"),
-        "article_count": len(evaluation.get("article_ids", [])),
     }
 
 
@@ -682,6 +659,16 @@ def quality_candidate_selection_node(
                 publication_date=_record_publication_date(record),
                 publication_year=_optional_int(record.get("publication_year")),
                 study_design=_optional_text(record.get("study_design")),
+                keywords=tuple(
+                    str(item).strip()
+                    for item in (
+                        record.get("keywords")
+                        or record.get("mesh_headings")
+                        or record.get("publication_types")
+                        or []
+                    )
+                    if str(item).strip()
+                ),
             )
             for article_id, record in records_by_article_id.items()
             if str(record.get("title", "")).strip()
@@ -859,306 +846,6 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
-def group_articles_node(
-    work_cache: RedisWorkCache | None = None,
-    langfuse_runtime: LangfuseRuntime | None = None,
-):
-    """按确定性研究类型规则分组，不让 LLM 自由生成组名。"""
-
-    async def group_articles_node(state: EvidenceState) -> dict[str, Any]:
-        groups, quality_groups = group_quality_articles(
-            state.get("search_results", [])
-        )
-        if work_cache is not None:
-            for group in quality_groups:
-                await work_cache.replace_group_article_ids(
-                    state["task_id"],
-                    group["group_id"],
-                    group["article_ids"],
-                )
-        return {
-            "article_groups": groups,
-            "quality_groups": quality_groups,
-            "task_stage": "articles_grouped",
-        }
-
-    if langfuse_runtime is None:
-        return group_articles_node
-    return langfuse_runtime.wrap_node(
-        name="quality-grouping",
-        as_type="chain",
-        node=group_articles_node,
-        input_metrics=lambda state: {
-            "search_result_count": len(state.get("search_results", [])),
-        },
-        output_metrics=lambda result: {
-            "group_count": len(result.get("quality_groups", [])),
-            "groups": [
-                {
-                    "study_design": group.get("study_design"),
-                    "article_count": len(group.get("article_ids", [])),
-                }
-                for group in result.get("quality_groups", [])
-            ],
-        },
-    )
-def _split_quality_batch(
-    group: Mapping[str, Any],
-    *,
-    max_batch_size: int = 10,
-) -> list[dict[str, Any]]:
-    """兼容旧调用方，实际逻辑由质量评估子图提供。"""
-
-    return split_quality_batch(group, max_batch_size=max_batch_size)
-
-def quality_batcher_node(
-    *,
-    max_batch_size: int = 10,
-    langfuse_runtime: LangfuseRuntime | None = None,
-):
-    """将研究类型分组切割成稳定的质量评估批次。"""
-
-    async def quality_batcher_node(
-        state: EvidenceState,
-    ) -> dict[str, Any]:
-        batches: list[dict[str, Any]] = []
-
-        for group in state.get("quality_groups", []):
-            batches.extend(
-                split_quality_batch(
-                    group,
-                    max_batch_size=max_batch_size,
-                )
-            )
-
-        return {
-            "quality_batches": batches,
-            "task_stage": "quality_batches_created",
-        }
-
-    if langfuse_runtime is None:
-        return quality_batcher_node
-    return langfuse_runtime.wrap_node(
-        name="quality-batching",
-        as_type="chain",
-        node=quality_batcher_node,
-        input_metrics=lambda state: {
-            "group_count": len(state.get("quality_groups", [])),
-            "max_batch_size": max_batch_size,
-        },
-        output_metrics=lambda result: {
-            "batch_count": len(result.get("quality_batches", [])),
-            "batch_article_counts": [
-                len(batch.get("article_ids", []))
-                for batch in result.get("quality_batches", [])
-            ],
-        },
-    )
-
-def quality_group_router():
-    """把每个分组派发给独立 Quality Evaluator 分支。"""
-
-    def route_quality_groups(state: EvidenceState) -> list[Send] | str:
-        groups = state.get("quality_batches") or state.get("quality_groups", [])
-        if not groups:
-            return END
-        return [
-            Send(
-                "quality_evaluator",
-                {
-                    "task_id": state["task_id"],
-                    "user_query": state.get("user_query", ""),
-                    "intent_analysis": state.get("intent_analysis", {}),
-                    "search_plan": state.get("search_plan", {}),
-                    "quality_group": group,
-                },
-            )
-            for group in groups
-        ]
-
-    return route_quality_groups
-
-
-def quality_evaluator_node(
-    evaluator: QualityEvaluatorCallable | Any | None = None,
-    *,
-    langfuse_runtime: LangfuseRuntime | None = None,
-):
-    """创建 Quality Evaluator 节点。
-
-    ``evaluator`` 可以是函数，也可以是提供 ``evaluate(group)`` 方法的 skill
-    适配器。尚未配置时只返回 ``pending``，不会伪造质量分数。
-    """
-
-    async def quality_evaluator_node(branch: Mapping[str, Any]) -> dict[str, Any]:
-        group = dict(branch["quality_group"])
-        if evaluator is None:
-            evaluation: Any = {
-                "status": "pending",
-                "reason": "quality_evaluator_not_configured",
-            }
-        else:
-            try:
-                evaluate_branch = getattr(evaluator, "evaluate_branch", None)
-                if evaluate_branch is not None:
-                    evaluation = evaluate_branch(branch)
-                else:
-                    evaluate = getattr(evaluator, "evaluate", evaluator)
-                    evaluation = evaluate(group)
-                if inspect.isawaitable(evaluation):
-                    evaluation = await evaluation
-                if hasattr(evaluation, "to_dict"):
-                    evaluation = evaluation.to_dict()
-                elif isinstance(evaluation, BaseModel):
-                    evaluation = evaluation.model_dump(mode="json")
-                elif not isinstance(evaluation, dict):
-                    evaluation = {"value": evaluation}
-            except Exception as exc:
-                logger.bind(
-                    component="quality_evaluator",
-                    event="quality_group_failed",
-                    group_id=group["group_id"],
-                    error_type=type(exc).__name__,
-                ).exception("质量评价分支执行失败")
-                evaluation = {
-                    "status": "evaluation_failed",
-                    "error_type": type(exc).__name__,
-                    "reason": str(exc),
-                }
-
-        return {
-            "quality_evaluation_results": [
-                {
-                    "group_id": group["group_id"],
-                    "article_ids": group["article_ids"],
-                    "evaluation": evaluation,
-                }
-            ]
-        }
-
-    if langfuse_runtime is None:
-        return quality_evaluator_node
-    return langfuse_runtime.wrap_node(
-        name="quality-evaluation-branch",
-        as_type="agent",
-        node=quality_evaluator_node,
-        input_metrics=lambda branch: {
-            "group_id": branch.get("quality_group", {}).get("group_id"),
-            "study_design": branch.get("quality_group", {}).get("study_design"),
-            "article_count": len(
-                branch.get("quality_group", {}).get("article_ids", [])
-            ),
-        },
-        output_metrics=_quality_branch_metrics,
-    )
-
-
-def quality_evaluation_fan_in_node(
-    work_cache: RedisWorkCache | None = None,
-    *,
-    evaluator: QualityEvaluatorCallable | Any | None = None,
-    langfuse_runtime: LangfuseRuntime | None = None,
-):
-    """回收各 Quality Evaluator 分支的结果。"""
-
-    async def quality_evaluation_fan_in_node(state: EvidenceState) -> dict[str, Any]:
-        evaluations = list(state.get("quality_evaluation_results", []))
-        if work_cache is not None:
-            await work_cache.set_task_status(
-                state["task_id"],
-                "quality_evaluated",
-                group_count=len(evaluations),
-            )
-        result: dict[str, Any] = {
-            "evaluated_evidence": evaluations,
-            "task_stage": "quality_evaluated",
-        }
-        finalize = getattr(evaluator, "finalize", None)
-        if finalize is None:
-            return result
-
-        failures = [
-            item
-            for item in evaluations
-            if item["evaluation"].get("status") == "evaluation_failed"
-        ]
-        group_results = [
-            item["evaluation"]
-            for item in evaluations
-            if item["evaluation"].get("status") != "evaluation_failed"
-        ]
-        outcome = finalize(
-            task_id=state["task_id"],
-            user_query=state.get("user_query", ""),
-            intent_analysis=state.get("intent_analysis", {}),
-            search_plan=state.get("search_plan", {}),
-            group_results=group_results,
-        )
-        if inspect.isawaitable(outcome):
-            outcome = await outcome
-        if hasattr(outcome, "to_dict"):
-            outcome_payload = outcome.to_dict()
-        elif isinstance(outcome, BaseModel):
-            outcome_payload = outcome.model_dump(mode="json")
-        elif isinstance(outcome, dict):
-            outcome_payload = outcome
-        else:
-            raise TypeError("Quality evaluator finalize 必须返回结构化结果")
-
-        scored_assessments = [
-            score
-            for group in group_results
-            for score in group.get("scores", [])
-        ]
-        retained_ids = {
-            str(article_id)
-            for group in group_results
-            for article_id in group.get("retained_article_ids", [])
-        }
-        excluded_ids = {
-            str(article_id)
-            for group in group_results
-            for article_id in group.get("excluded_article_ids", [])
-        }
-        result.update(
-            {
-                "quality_evaluation_failures": failures,
-                "scored_assessments": scored_assessments,
-                "retained_candidates": [
-                    score
-                    for score in scored_assessments
-                    if str(score["article_id"]) in retained_ids
-                ],
-                "excluded_candidates": [
-                    score
-                    for score in scored_assessments
-                    if str(score["article_id"]) in excluded_ids
-                ],
-                "portfolio_evaluation": outcome_payload.get("portfolio_evaluation"),
-                "ranked_candidates": outcome_payload.get("ranked_candidates", []),
-                "task_stage": "quality_ranked",
-            }
-        )
-        return result
-
-    if langfuse_runtime is None:
-        return quality_evaluation_fan_in_node
-    return langfuse_runtime.wrap_node(
-        name="quality-evaluation-fan-in",
-        as_type="chain",
-        node=quality_evaluation_fan_in_node,
-        input_metrics=lambda state: {
-            "evaluation_group_count": len(state.get("quality_evaluation_results", [])),
-        },
-        output_metrics=lambda result: {
-            "retained_candidate_count": len(result.get("retained_candidates", [])),
-            "excluded_candidate_count": len(result.get("excluded_candidates", [])),
-            "failure_count": len(result.get("quality_evaluation_failures", [])),
-            "ranked_candidate_count": len(result.get("ranked_candidates", [])),
-        },
-    )
-
-
 def evidence_summarizer_node(
     summarizer: Any | None,
     work_cache: RedisWorkCache | None = None,
@@ -1184,6 +871,7 @@ def evidence_summarizer_node(
                 portfolio_evaluation=state.get("portfolio_evaluation"),
                 ranked_candidates=state.get("ranked_candidates", []),
                 search_metrics=state.get("search_metrics", {}),
+                quality_evaluation_failures=state.get("quality_evaluation_failures", []),
             )
             if inspect.isawaitable(result):
                 result = await result

@@ -147,6 +147,7 @@ class TaskResponse(BaseModel):
     status: TaskStatus
     stage: TaskStage | None = None
     result: dict[str, Any] | None = None
+    quality_progress: dict[str, Any] | None = None
     error: TaskError | None = None
     created_at: datetime
     updated_at: datetime
@@ -257,6 +258,7 @@ class PublicResearchResult(BaseModel):
     coverage_gaps: list[str] = Field(default_factory=list)
     conflict_summary: str | None = None
     no_recommendation_reason: str | None = None
+    quality_evaluation_failures: list[dict[str, Any]] = Field(default_factory=list)
     search_overview: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -275,6 +277,7 @@ class AGUIEventType(StrEnum):
         RUN_FINISHED: 运行结束。
     """
 
+    CUSTOM = "CUSTOM"
     RUN_STARTED = "RUN_STARTED"
     STATE_SNAPSHOT = "STATE_SNAPSHOT"
     STEP_STARTED = "STEP_STARTED"

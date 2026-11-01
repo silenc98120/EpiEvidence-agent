@@ -45,6 +45,10 @@ class TaskStore:
         async with self._lock:
             return self._tasks.get(task_id)
 
+    async def restore(self, task: TaskResponse) -> None:
+        async with self._lock:
+            self._tasks[task.task_id] = task
+
     async def list(self) -> list[TaskResponse]:
         """Return all tasks with the newest task first."""
 
@@ -69,6 +73,7 @@ class TaskStore:
         stage: TaskStage | None = None,
         result: dict | None = None,
         error: TaskError | None = None,
+        quality_progress: dict | None = None,
     ) -> TaskResponse | None:
         """Update supplied fields and return the new snapshot."""
 
@@ -82,7 +87,8 @@ class TaskStore:
                     "status": status if status is not None else current.status,
                     "stage": stage if stage is not None else current.stage,
                     "result": result if result is not None else current.result,
-                    "error": error if error is not None else current.error,
+                    "error": error if error is not None else (None if status == TaskStatus.RUNNING else current.error),
+                    "quality_progress": quality_progress if quality_progress is not None else current.quality_progress,
                     "updated_at": datetime.now(timezone.utc),
                 }
             )
@@ -142,6 +148,9 @@ class RedisTaskStore:
         except (TypeError, ValueError):
             return None
 
+    async def restore(self, task: TaskResponse) -> None:
+        await self._write(task)
+
     async def list(self) -> list[TaskResponse]:
         ids = await self._call("zrevrange", self._index_key(), 0, -1)
         if not isinstance(ids, (list, tuple)):
@@ -164,6 +173,7 @@ class RedisTaskStore:
         stage: TaskStage | None = None,
         result: dict | None = None,
         error: TaskError | None = None,
+        quality_progress: dict | None = None,
     ) -> TaskResponse | None:
         current = await self.get(task_id)
         if current is None:
@@ -173,7 +183,8 @@ class RedisTaskStore:
                 "status": status if status is not None else current.status,
                 "stage": stage if stage is not None else current.stage,
                 "result": result if result is not None else current.result,
-                "error": error if error is not None else current.error,
+                "error": error if error is not None else (None if status == TaskStatus.RUNNING else current.error),
+                    "quality_progress": quality_progress if quality_progress is not None else current.quality_progress,
                 "updated_at": datetime.now(timezone.utc),
             }
         )

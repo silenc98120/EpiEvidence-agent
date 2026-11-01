@@ -1,117 +1,77 @@
-"""质量评估子图的分组与批次准备阶段。
-
-本模块只负责 Agent 侧编排数据的准备：把规范化检索结果按研究类型分组，
-再稳定地切成可提交给 Celery Worker 的独立批次。单个批次的质量评估仍由
-``backend.app.workers.celery_tasks`` 执行。
-"""
-
+"""单篇 Send 编排：持久化输入、共享并发、结果对账与集合收敛。"""
 from __future__ import annotations
 
-import asyncio
+import hashlib
 import inspect
+import json
+import os
 import re
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any, TypedDict
-from uuid import UUID
+from datetime import date
+from typing import Annotated, Any, TypedDict
+from uuid import UUID, NAMESPACE_URL, uuid5
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command
-from sqlalchemy import select
+from langgraph.types import Command, Send
 
 from backend.agent.state import EvidenceState
 from backend.app.cache import RedisWorkCache
-from backend.app.db.models import QualityEvaluationBatchORM
-from backend.app.db.session import build_session_factory
 from backend.app.observability import LangfuseRuntime
 from backend.app.core.search_results_normalizer import infer_study_design
-from backend.app.workers.celery_app import celery_app
-from backend.skills.quality_evaluator.repository import ArticleRepository
-from backend.skills.quality_evaluator.schema import (
-    HydratedArticleBatch,
-    QualityEvaluationJob,
-    StudyType,
-)
-from backend.skills.quality_evaluator.scoring import partition_by_threshold
-from backend.skills.quality_evaluator.subgraph import GroupEvaluationResult
+from backend.skills.quality_evaluator.execution import BatchExecutor, ModelRequestLimiter
+from backend.skills.quality_evaluator.schema import HydratedArticleBatch, QualityEvaluationJob, StudyType, PortfolioEvaluation, article_assessment_model_for
+from backend.skills.quality_evaluator.scoring import ArticleScore, rank_candidates
+
+
+def merge_batch_refs(left: list[dict], right: list[dict]) -> list[dict]:
+    return list({item["batch_id"]: item for item in [*left, *right]}.values())
 
 
 class QualityEvaluationSubgraphState(TypedDict, total=False):
-    """质量评估子图内部需要的最小可序列化状态。"""
-
     task_id: str
-    search_results: list[dict[str, Any]]
-    article_groups: dict[str, list[str]]
-    quality_groups: list[dict[str, Any]]
-    unsupported_quality_groups: list[dict[str, Any]]
-    quality_batches: list[dict[str, Any]]
-    quality_batch_results: list[dict[str, Any]]
-    quality_batch_status: dict[str, str]
-    quality_batch_failures: list[dict[str, Any]]
+    user_query: str
+    intent_analysis: dict
+    search_plan: dict
+    search_results: list[dict]
+    article_groups: dict
+    quality_groups: list[dict]
+    unsupported_quality_groups: list[dict]
+    quality_batches: list[dict]
+    execution_id: str
+    quality_batch_results: Annotated[list[dict], merge_batch_refs]
+    persisted_results: list[dict]
+    quality_batch_status: dict
+    quality_batch_failures: list[dict]
     all_quality_batches_terminal: bool
-    retained_articles: list[dict[str, Any]]
-    excluded_articles: list[dict[str, Any]]
-    ranked_articles: list[dict[str, Any]]
-    truncated_candidates: list[dict[str, Any]]
+    retained_articles: list[dict]
+    excluded_articles: list[dict]
+    ranked_articles: list[dict]
+    truncated_candidates: list[dict]
     quality_candidates_truncated: bool
-    quality_reason_summaries: list[dict[str, Any]]
-    quality_reason_failures: list[dict[str, Any]]
+    quality_reason_summaries: list[dict]
+    quality_reason_failures: list[dict]
     quality_candidate_limit: int
-    portfolio_evaluation: dict[str, Any] | None
+    portfolio_evaluation: dict | None
+    portfolio_degraded: bool
+    portfolio_order: list[str]
     quality_screening_threshold: float
     quality_batches_timed_out: bool
-    user_query: str
-    retained_candidates: list[dict[str, Any]]
-    excluded_candidates: list[dict[str, Any]]
-    quality_evaluation_failures: list[dict[str, Any]]
-    ranked_candidates: list[dict[str, Any]]
+    retained_candidates: list[dict]
+    excluded_candidates: list[dict]
+    quality_evaluation_failures: list[dict]
+    ranked_candidates: list[dict]
     task_stage: str
 
 
-QUALITY_TASK_BY_STUDY_TYPE: dict[StudyType, str] = {
-    StudyType.RCT: "quality.evaluate_rct_batch",
-    StudyType.COHORT: "quality.evaluate_cohort_batch",
-    StudyType.CASE_CONTROL: "quality.evaluate_case_control_batch",
-    StudyType.CROSS_SECTIONAL_ANALYTICAL: (
-        "quality.evaluate_cross_sectional_analytical_batch"
-    ),
-    StudyType.CROSS_SECTIONAL_PREVALENCE: (
-        "quality.evaluate_cross_sectional_prevalence_batch"
-    ),
-    StudyType.SYSTEMATIC_REVIEW: "quality.evaluate_systematic_review_batch",
-    StudyType.META_ANALYSIS: "quality.evaluate_meta_analysis_batch",
-    StudyType.QUALITATIVE_SYSTEMATIC_REVIEW: (
-        "quality.evaluate_qualitative_systematic_review_batch"
-    ),
-    StudyType.UMBRELLA_REVIEW: "quality.evaluate_umbrella_review_batch",
-    StudyType.NARRATIVE_REVIEW: "quality.evaluate_narrative_review_batch",
-}
+QualityBatchHydrator = Callable[..., Awaitable[HydratedArticleBatch]]
+QualityReasonSummarizer = Callable[[Sequence[Mapping[str, Any]]], Awaitable[Sequence[Mapping[str, Any]]]]
 
 
-QUALITY_QUEUE_BY_STUDY_TYPE: dict[StudyType, str] = {
-    StudyType.RCT: "quality-rct",
-    StudyType.COHORT: "quality-cohort",
-    StudyType.CASE_CONTROL: "quality-case-control",
-    StudyType.CROSS_SECTIONAL_ANALYTICAL: "quality-cross-sectional-analytical",
-    StudyType.CROSS_SECTIONAL_PREVALENCE: "quality-cross-sectional-prevalence",
-    StudyType.SYSTEMATIC_REVIEW: "quality-systematic-review",
-    StudyType.META_ANALYSIS: "quality-meta-analysis",
-    StudyType.QUALITATIVE_SYSTEMATIC_REVIEW: (
-        "quality-qualitative-systematic-review"
-    ),
-    StudyType.UMBRELLA_REVIEW: "quality-umbrella-review",
-    StudyType.NARRATIVE_REVIEW: "quality-narrative-review",
-}
-
-
-QualityBatchDispatcher = Callable[[str, dict[str, Any], str], Any]
-QualityBatchReader = Callable[[str, Sequence[str]], Awaitable[list[dict[str, Any]]]]
-QualityBatchHydrator = Callable[
-    [QualityEvaluationJob, str], Awaitable[HydratedArticleBatch]
-]
-QualityReasonSummarizer = Callable[
-    [Sequence[Mapping[str, Any]]], Awaitable[Sequence[Mapping[str, Any]]]
-]
+def _fingerprint(payload: Any) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _clean_group_value(value: Any) -> str | None:
@@ -204,7 +164,7 @@ def group_quality_articles(
 def split_quality_batch(
     group: Mapping[str, Any],
     *,
-    max_batch_size: int = 5,
+    max_batch_size: int = 1,
 ) -> list[dict[str, Any]]:
     """将一个研究类型分组稳定地切成可独立执行的批次。"""
 
@@ -260,8 +220,12 @@ def quality_grouping_node(work_cache: RedisWorkCache | None = None):
     return group_node
 
 
-def quality_batcher_node(*, max_batch_size: int = 5):
+def quality_batcher_node(*, max_batch_size: int = 1):
     """创建质量评估子图的批次切分节点。"""
+
+    configured_size = int(os.getenv("QUALITY_BATCH_SIZE", str(max_batch_size)))
+    if configured_size != 1:
+        raise ValueError("当前质量评估要求 QUALITY_BATCH_SIZE=1")
 
     async def batch_node(
         state: QualityEvaluationSubgraphState | EvidenceState,
@@ -286,7 +250,7 @@ def quality_batcher_node(*, max_batch_size: int = 5):
             for group in supported_groups
             for batch in split_quality_batch(
                 group,
-                max_batch_size=max_batch_size,
+                max_batch_size=configured_size,
             )
         ]
         return {
@@ -296,284 +260,6 @@ def quality_batcher_node(*, max_batch_size: int = 5):
         }
 
     return batch_node
-
-
-def _dispatch_quality_batch(
-    task_name: str,
-    payload: dict[str, Any],
-    queue_name: str,
-) -> Any:
-    """通过固定 Celery task 名称提交一个已经切好的批次。"""
-
-    return celery_app.send_task(
-        task_name,
-        kwargs={"payload": payload},
-        queue=queue_name,
-        routing_key=queue_name,
-    )
-
-
-def _build_quality_batch_payload(
-    batch: Mapping[str, Any],
-    *,
-    task_id: str,
-) -> dict[str, Any]:
-    try:
-        study_type = StudyType(str(batch["study_design"]))
-        group_id = str(batch["group_id"])
-        batch_id = str(batch["batch_id"])
-        article_ids = list(batch["article_ids"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("质量评估 batch 缺少合法的任务、研究类型或文章 ID") from exc
-
-    if study_type not in QUALITY_TASK_BY_STUDY_TYPE:
-        raise ValueError(f"暂未配置 {study_type.value} 的固定 Celery task")
-    return {
-        "batch_id": batch_id,
-        "job": {
-            "task_id": task_id,
-            "group_id": group_id,
-            "study_type": study_type.value,
-            "article_ids": [str(article_id) for article_id in article_ids],
-        },
-    }
-
-
-def submit_quality_batches_node(
-    dispatcher: QualityBatchDispatcher | None = None,
-    batch_repository: Any | None = None,
-):
-    """将质量评估子图生成的 batch 提交给固定研究类型 Celery task。"""
-
-    send = dispatcher or _dispatch_quality_batch
-
-    async def submit_node(
-        state: QualityEvaluationSubgraphState | EvidenceState,
-    ) -> dict[str, Any]:
-        submitted: list[dict[str, Any]] = []
-        for raw_batch in state.get("quality_batches", []):
-            batch = dict(raw_batch)
-            if batch.get("celery_task_id"):
-                submitted.append(batch)
-                continue
-            payload = _build_quality_batch_payload(
-                batch,
-                task_id=str(state["task_id"]),
-            )
-            study_type = StudyType(payload["job"]["study_type"])
-            task_name = QUALITY_TASK_BY_STUDY_TYPE[study_type]
-            queue_name = QUALITY_QUEUE_BY_STUDY_TYPE[study_type]
-            if batch_repository is not None:
-                await batch_repository.register_pending(
-                    task_id=str(state["task_id"]),
-                    batch_id=str(payload["batch_id"]),
-                    group_id=str(payload["job"]["group_id"]),
-                    study_type=study_type.value,
-                    article_ids=[UUID(str(article_id)) for article_id in payload["job"]["article_ids"]],
-                )
-            result = send(task_name, payload, queue_name)
-            if hasattr(result, "id"):
-                celery_task_id = str(result.id)
-            else:
-                celery_task_id = str(result)
-            if batch_repository is not None:
-                await batch_repository.attach_celery_task_id(
-                    task_id=str(state["task_id"]),
-                    batch_id=str(payload["batch_id"]),
-                    celery_task_id=celery_task_id,
-                )
-            submitted.append(
-                {
-                    **batch,
-                    "celery_task_id": celery_task_id,
-                    "task_name": task_name,
-                    "queue_name": queue_name,
-                    "status": "submitted",
-                }
-            )
-        return {
-            "quality_batches": submitted,
-            "task_stage": "quality_batches_submitted",
-        }
-
-    return submit_node
-
-
-_batch_session_factory: Any | None = None
-
-
-def _get_batch_session_factory() -> Any:
-    global _batch_session_factory
-    if _batch_session_factory is None:
-        _batch_session_factory = build_session_factory()
-    return _batch_session_factory
-
-
-async def _read_quality_batch_results(
-    task_id: str,
-    batch_ids: Sequence[str],
-) -> list[dict[str, Any]]:
-    """从 PostgreSQL 读取当前任务的批次状态和已持久化结果。"""
-
-    if not batch_ids:
-        return []
-    session_factory = _get_batch_session_factory()
-    statement = select(QualityEvaluationBatchORM).where(
-        QualityEvaluationBatchORM.task_id == task_id,
-        QualityEvaluationBatchORM.batch_id.in_(list(batch_ids)),
-    )
-    async with session_factory() as session:
-        rows = list((await session.scalars(statement)).all())
-    return [
-        {
-            "batch_id": row.batch_id,
-            "group_id": row.group_id,
-            "study_type": row.study_type,
-            "status": row.status,
-            "attempt_count": row.attempt_count,
-            "article_ids": [str(article_id) for article_id in row.article_ids],
-            "assessment_payload": row.assessment_payload,
-            "score_payload": row.score_payload,
-            "retained_article_ids": [
-                str(article_id) for article_id in row.retained_article_ids
-            ],
-            "excluded_article_ids": [
-                str(article_id) for article_id in row.excluded_article_ids
-            ],
-            "error_type": row.error_type,
-            "error_message": row.error_message,
-        }
-        for row in rows
-    ]
-
-
-def read_quality_batch_results_node(
-    reader: QualityBatchReader | None = None,
-):
-    """读取 Celery Worker 写入 PostgreSQL 的批次结果。"""
-
-    load_results = reader or _read_quality_batch_results
-
-    async def read_node(
-        state: QualityEvaluationSubgraphState | EvidenceState,
-    ) -> dict[str, Any]:
-        task_id = str(state["task_id"])
-        batches = list(state.get("quality_batches", []))
-        batch_ids = [str(batch["batch_id"]) for batch in batches]
-        results = await load_results(task_id, batch_ids)
-        status_by_batch = {item["batch_id"]: item["status"] for item in results}
-        failures = [
-            item
-            for item in results
-            if item["status"] == "failed"
-        ]
-        all_terminal = len(results) == len(batch_ids) and all(
-            item["status"] in {"completed", "failed"} for item in results
-        )
-        return {
-            "quality_batch_results": results,
-            "quality_batch_status": status_by_batch,
-            "quality_batch_failures": failures,
-            "all_quality_batches_terminal": all_terminal,
-            "task_stage": (
-                "quality_batches_ready"
-                if all_terminal
-                else "quality_batches_waiting"
-            ),
-        }
-
-    return read_node
-
-
-def poll_quality_batches_node(
-    reader: QualityBatchReader | None = None,
-    *,
-    poll_interval_seconds: float = 2.0,
-    max_poll_interval_seconds: float = 10.0,
-    timeout_seconds: float = 900.0,
-):
-    """在子图内部轮询 PostgreSQL，直到所有 batch 结束或超时。"""
-
-    if poll_interval_seconds <= 0:
-        raise ValueError("poll_interval_seconds 必须大于 0")
-    if max_poll_interval_seconds < poll_interval_seconds:
-        raise ValueError("max_poll_interval_seconds 不能小于 poll_interval_seconds")
-    if timeout_seconds <= 0:
-        raise ValueError("timeout_seconds 必须大于 0")
-
-    load_results = reader or _read_quality_batch_results
-
-    async def poll_node(
-        state: QualityEvaluationSubgraphState | EvidenceState,
-    ) -> dict[str, Any]:
-        task_id = str(state["task_id"])
-        batches = list(state.get("quality_batches", []))
-        batch_ids = [str(batch["batch_id"]) for batch in batches]
-        deadline = time.monotonic() + timeout_seconds
-        interval = poll_interval_seconds
-
-        while True:
-            results = await load_results(task_id, batch_ids)
-            status_by_batch = {
-                item["batch_id"]: item["status"] for item in results
-            }
-            failures = [
-                item for item in results if item["status"] == "failed"
-            ]
-            all_terminal = len(results) == len(batch_ids) and all(
-                item["status"] in {"completed", "failed"} for item in results
-            )
-            if all_terminal:
-                return {
-                    "quality_batch_results": results,
-                    "quality_batch_status": status_by_batch,
-                    "quality_batch_failures": failures,
-                    "all_quality_batches_terminal": True,
-                    "quality_batches_timed_out": False,
-                    "task_stage": "quality_batches_ready",
-                }
-            if time.monotonic() >= deadline:
-                return {
-                    "quality_batch_results": results,
-                    "quality_batch_status": status_by_batch,
-                    "quality_batch_failures": failures,
-                    "all_quality_batches_terminal": False,
-                    "quality_batches_timed_out": True,
-                    "task_stage": "quality_evaluation_timeout",
-                }
-            await asyncio.sleep(interval)
-            interval = min(interval * 1.5, max_poll_interval_seconds)
-
-    return poll_node
-
-
-def _group_result_from_batch(
-    *,
-    task_id: str,
-    batch: Mapping[str, Any],
-) -> GroupEvaluationResult:
-    """将批次表中的 JSON 载荷恢复为质量评估领域结果。"""
-
-    try:
-        job = QualityEvaluationJob(
-            task_id=task_id,
-            group_id=str(batch["group_id"]),
-            study_type=StudyType(str(batch["study_type"])),
-            article_ids=[str(article_id) for article_id in batch["article_ids"]],
-        )
-        return GroupEvaluationResult.from_dict(
-            {
-                "job": job.model_dump(mode="json"),
-                "assessment": batch["assessment_payload"],
-                "scores": batch["score_payload"],
-                "retained_article_ids": [],
-                "excluded_article_ids": [],
-            }
-        )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            f"批次 {batch.get('batch_id', '<unknown>')} 的质量评估结果结构不合法"
-        ) from exc
 
 
 def _article_result_payload(
@@ -596,6 +282,8 @@ def _article_result_payload(
         "first_author": article.first_author,
         "publication_year": article.publication_year,
         "abstract": article.abstract,
+        "evidence_spans": getattr(article, "evidence_spans", {}),
+        "evidence_span_version": getattr(article, "evidence_span_version", None),
         "score": {
             "relevance_score": score.relevance_score,
             "quality_score": score.quality_score,
@@ -615,100 +303,178 @@ def _article_result_payload(
                 "",
             ),
         },
+        "quality_assessment": quality_assessment.model_dump(mode="json"),
+        "relevance_assessment": relevance_assessment.model_dump(mode="json"),
     }
 
 
-def organize_quality_results_node(
-    *,
-    hydrator: QualityBatchHydrator | None = None,
-    threshold: float = 3.0,
-):
-    """筛除低分文章并整理成主图可消费的完整文章对象。"""
-
-    if threshold < 0:
-        raise ValueError("质量评估筛选阈值不能小于 0")
-
-    if hydrator is None:
-        article_repository = ArticleRepository(_get_batch_session_factory())
-
-        async def hydrate(
-            job: QualityEvaluationJob,
-            user_query: str,
-        ) -> HydratedArticleBatch:
-            return await article_repository.hydrate(job, user_query=user_query)
-
-        load_articles: QualityBatchHydrator = hydrate
-    else:
-        load_articles = hydrator
-
-    async def organize_node(
-        state: QualityEvaluationSubgraphState | EvidenceState,
-    ) -> dict[str, Any]:
-        retained_articles: list[dict[str, Any]] = []
-        excluded_articles: list[dict[str, Any]] = []
-        failures = list(state.get("quality_batch_failures", []))
-        task_id = str(state["task_id"])
-        user_query = str(state.get("user_query", "")).strip() or "质量评估任务"
-
-        for batch in state.get("quality_batch_results", []):
-            if batch.get("status") != "completed":
+def prepare_quality_plan_node(runtime: Any, repository: Any, hydrator: Any = None):
+    """一次读取每个分组，冻结影响评价的输入；登记成功后才允许分发。"""
+    async def prepare(state):
+        inputs = []
+        load = hydrator or runtime.repository.hydrate
+        hydration = {}
+        unsupported = {g["group_id"] for g in state["unsupported_quality_groups"]}
+        for group in state["quality_groups"]:
+            if group["group_id"] in unsupported:
                 continue
-            try:
-                group = _group_result_from_batch(task_id=task_id, batch=batch)
-                decision = partition_by_threshold(
-                    group.scores,
-                    threshold=threshold,
-                )
-                hydrated = await load_articles(group.job, user_query)
-                article_by_id = {
-                    article.article_id: article for article in hydrated.articles
-                }
-                relevance_by_id = {
-                    item.article_id: item
-                    for item in group.assessment.relevance_assessments
-                }
-                quality_by_id = {
-                    item.article_id: item
-                    for item in group.assessment.quality_assessments
-                }
-                for score in decision.retained:
-                    retained_articles.append(
-                        _article_result_payload(
-                            article=article_by_id[score.article_id],
-                            study_type=group.job.study_type,
-                            score=score,
-                            quality_assessment=quality_by_id[score.article_id],
-                            relevance_assessment=relevance_by_id[score.article_id],
-                        )
-                    )
-                for score in decision.excluded:
-                    excluded_articles.append(
-                        _article_result_payload(
-                            article=article_by_id[score.article_id],
-                            study_type=group.job.study_type,
-                            score=score,
-                            quality_assessment=quality_by_id[score.article_id],
-                            relevance_assessment=relevance_by_id[score.article_id],
-                        )
-                    )
-            except Exception as exc:
-                failures.append(
-                    {
-                        **batch,
-                        "error_type": type(exc).__name__,
-                        "error_message": str(exc),
-                    }
-                )
+            # 数据库 hydrate 可合并读取；每个持久化评估输入仍拆成单篇。
+            batch_size = int(os.getenv("QUALITY_BATCH_SIZE", "1"))
+            if batch_size != 1:
+                raise ValueError("当前质量评估要求 QUALITY_BATCH_SIZE=1")
+            for chunk in split_quality_batch(group, max_batch_size=5):
+                job = QualityEvaluationJob(task_id=state["task_id"], group_id=group["group_id"],
+                    study_type=StudyType(group["study_design"]), article_ids=chunk["article_ids"])
+                started = time.perf_counter()
+                hydrated = await load(job, user_query=state["user_query"])
+                elapsed = round((time.perf_counter() - started) * 1000, 3)
+                for article in hydrated.articles:
+                    single_job = job.model_copy(update={"article_ids": [article.article_id]})
+                    batch = HydratedArticleBatch(job=single_job, user_query=hydrated.user_query, articles=[article])
+                    inputs.append({"kind": "article", "evaluator_version": runtime.contract_version, "batch": batch.model_dump(mode="json"),
+                        "intent_analysis": state.get("intent_analysis", {}), "search_plan": state.get("search_plan", {})})
+                    hydration[str(article.article_id)] = {"hydrate_batch_ms": elapsed, "hydrate_batch_size": len(hydrated.articles), "attempts": []}
+        # 配置或评价规则变化不能复用旧评价。
+        version = {"evaluator_version": runtime.contract_version, "inputs": inputs}
+        execution_id = str(uuid5(NAMESPACE_URL, _fingerprint(version)))
+        batches = []
+        for snapshot in inputs:
+            job = snapshot["batch"]["job"]
+            batches.append({"batch_id": f"{execution_id}:{job['article_ids'][0]}",
+                "group_id": job["group_id"], "study_design": job["study_type"],
+                "article_ids": job["article_ids"], "input_payload": snapshot,
+                "metrics_payload": hydration[job["article_ids"][0]]})
+        await repository.register_plan(state["task_id"], execution_id, batches)
+        return {"execution_id": execution_id, "quality_batches": [
+            {k: v for k, v in b.items() if k not in {"input_payload", "metrics_payload"}} for b in batches],
+            "task_stage": "quality_plan_registered"}
+    return prepare
 
-        return {
-            "retained_articles": retained_articles,
-            "excluded_articles": excluded_articles,
-            "quality_batch_failures": failures,
-            "quality_screening_threshold": threshold,
-            "task_stage": "quality_screened",
-        }
 
-    return organize_node
+def fork_quality_experts():
+    def route(state):
+        queues = {}
+        for batch in state["quality_batches"]:
+            queues.setdefault(batch["study_design"], deque()).append(batch)
+        sends = []
+        while queues:
+            for kind in list(queues):
+                batch = queues[kind].popleft()
+                sends.append(Send(f"expert_{kind}", {"task_id": state["task_id"],
+                    "batch_id": batch["batch_id"], "study_type": kind}))
+                if not queues[kind]:
+                    del queues[kind]
+        return sends or "collect_expert_results"
+    return route
+
+
+def collect_expert_results_node(repository):
+    """以完整预期集合对账；节点回传的引用不作为结果事实。"""
+    async def collect(state):
+        ordered_ids = [b["batch_id"] for b in state["quality_batches"]]
+        expected = set(ordered_ids)
+        rows = await repository.read_batches(state["task_id"], ordered_ids)
+        actual = {r["batch_id"] for r in rows}
+        if actual != expected:
+            raise RuntimeError("质量评估持久化计划缺失，无法完成对账")
+        by_id = {r["batch_id"]: r for r in rows}
+        rows = [by_id[key] for key in ordered_ids]
+        unfinished = [r for r in rows if r["status"] in {"pending", "processing"}]
+        if unfinished:
+            from datetime import datetime, timezone
+            if any(r["status"] == "processing" and r["lease_expires_at"] > datetime.now(timezone.utc) for r in unfinished):
+                raise RuntimeError("质量评估批次仍持有有效租约，请在到期后恢复任务")
+            return Command(goto=[Send(f"expert_{r['study_type']}", {"task_id": state["task_id"],
+                "batch_id": r["batch_id"], "study_type": r["study_type"]}) for r in unfinished])
+        failures = [{"batch_id": r["batch_id"], "article_ids": r["article_ids"],
+            "status": "not_evaluated", "error_type": r["error_type"]} for r in rows if r["status"] != "completed"]
+        failures.extend(state.get("unsupported_quality_groups", []))
+        if expected and not any(r["status"] == "completed" for r in rows):
+            raise RuntimeError("全部文章质量评估失败，无法生成推荐")
+        # 只把 JSON 快照送入 checkpoint，避免 ORM 时间戳泄漏到图契约。
+        return Command(goto="organize_quality_results", update={"persisted_results": [{k: r[k] for k in ("batch_id", "status", "input_payload", "assessment_payload", "score_payload")} for r in rows],
+            "quality_batch_failures": failures, "quality_batch_status": {r["batch_id"]: r["status"] for r in rows},
+            "all_quality_batches_terminal": True, "task_stage": "quality_batches_ready"})
+    return collect
+
+
+def organize_quality_results_node(*, threshold=3.0):
+    async def organize(state):
+        retained, excluded = [], []
+        for row in state["persisted_results"]:
+            if row["status"] != "completed":
+                continue
+            batch = HydratedArticleBatch.model_validate(row["input_payload"]["batch"])
+            assessment = article_assessment_model_for(batch.job.study_type).model_validate(row["assessment_payload"])
+            relevance = {a.article_id: a for a in assessment.relevance_assessments}
+            quality = {a.article_id: a for a in assessment.quality_assessments}
+            articles = {a.article_id: a for a in batch.articles}
+            for payload in row["score_payload"]:
+                score = ArticleScore(**{**payload, "article_id": UUID(payload["article_id"])})
+                article = _article_result_payload(article=articles[score.article_id], study_type=batch.job.study_type,
+                    score=score, quality_assessment=quality[score.article_id], relevance_assessment=relevance[score.article_id])
+                published = articles[score.article_id].publication_date
+                article["publication_date"] = published.isoformat() if published else None
+                (retained if score.composite_score > threshold else excluded).append(article)
+        return {"retained_articles": retained, "excluded_articles": excluded,
+            "quality_screening_threshold": threshold, "task_stage": "quality_screened"}
+    return organize
+
+
+def evaluate_portfolio_node(executor, repository):
+    async def portfolio(state):
+        candidates = state["retained_articles"]
+        if not candidates:
+            return {"portfolio_evaluation": None, "portfolio_degraded": False}
+
+        def portfolio_candidate(article: Mapping[str, Any]) -> dict[str, Any]:
+            quality = dict(article["quality_assessment"])
+            quality.pop("article_id", None)
+            quality.pop("study_type", None)
+            quality["criteria"] = [
+                {key: value for key, value in criterion.items() if key != "evidence_quote"}
+                for criterion in quality["criteria"]
+            ]
+            relevance = dict(article["relevance_assessment"])
+            relevance.pop("article_id", None)
+            return {
+                "article_id": article["article_id"],
+                "title": article["title"],
+                "abstract": article["abstract"],
+                "evidence_spans": article.get("evidence_spans", {}),
+                "study_type": article["study_type"],
+                "publication_year": article["publication_year"],
+                "publication_date": article["publication_date"],
+                "composite_score": article["score"]["composite_score"],
+                "quality_assessment": quality,
+                "relevance_assessment": relevance,
+            }
+
+        payload = {"task_id": state["task_id"], "user_query": state["user_query"],
+            "intent_analysis": state.get("intent_analysis", {}), "search_plan": state.get("search_plan", {}),
+            "candidate_articles": [portfolio_candidate(a) for a in candidates]}
+        # 日期统一转 JSON，数据库与模型使用同一冻结输入。
+        payload = json.loads(json.dumps(payload, default=str))
+        batch_id = f"{state['execution_id']}:portfolio:{_fingerprint([payload, executor.runtime.prompt_loader.portfolio_prompt(), PortfolioEvaluation.model_json_schema()])[:16]}"
+        await repository.register_plan(state["task_id"], state["execution_id"], [{"batch_id": batch_id,
+            "group_id": "portfolio", "study_design": "portfolio", "article_ids": [a["article_id"] for a in candidates],
+            "input_payload": {"kind": "portfolio", "input": payload}}])
+        row = await executor.execute(state["task_id"], batch_id)
+        if row["status"] != "completed":
+            return {"portfolio_evaluation": None, "portfolio_degraded": True,
+                "quality_batch_failures": [*state["quality_batch_failures"],
+                {"stage": "portfolio", "status": "degraded", "error_type": row["error_type"] or "not_completed"}]}
+        result = PortfolioEvaluation.model_validate(row["assessment_payload"])
+        scores = [ArticleScore(article_id=UUID(a["article_id"]), **a["score"]) for a in candidates]
+        dates = {UUID(a["article_id"]): date.fromisoformat(str(a["publication_date"])) if a["publication_date"] else None for a in candidates}
+        ranked = rank_candidates(scores, result.article_contributions, publication_dates=dates)
+        by_id = {str(c.article_id): c.coverage_contribution_score for c in result.article_contributions}
+        return {"portfolio_evaluation": result.model_dump(mode="json"),
+            "portfolio_degraded": False,
+            "portfolio_order": [str(a.article_id) for a in ranked],
+            "retained_articles": [{**a, "coverage_contribution_score": by_id[a["article_id"]]} for a in candidates],
+            "task_stage": "quality_portfolio_evaluated"}
+    return portfolio
 
 
 def rank_and_limit_quality_candidates_node(
@@ -738,26 +504,12 @@ def rank_and_limit_quality_candidates_node(
                 raise ValueError(f"保留候选 article_id 重复: {article_id}")
             seen.add(article_id)
 
-        def sort_key(article: Mapping[str, Any]) -> tuple[Any, ...]:
-            score = article.get("score", {})
-            composite = float(
-                article.get(
-                    "composite_score",
-                    score.get("composite_score", 0.0),
-                )
-            )
-            coverage = float(article.get("coverage_contribution_score", 0.0))
-            year = article.get("publication_year")
-            year_value = int(year) if year is not None else 0
-            return (
-                -composite,
-                -coverage,
-                year is None,
-                -year_value,
-                str(article["article_id"]),
-            )
-
-        ranked = sorted(retained, key=sort_key)
+        if state.get("portfolio_evaluation"):
+            order = state["portfolio_order"]
+            by_id = {a["article_id"]: a for a in retained}
+            ranked = [by_id[article_id] for article_id in order]
+        else:
+            ranked = sorted(retained, key=lambda a: (-a["score"]["composite_score"], a["article_id"]))
         should_truncate = len(ranked) > max_candidates_before_truncation
         selected = (
             ranked[:max_candidates_for_summarizer]
@@ -779,7 +531,7 @@ def rank_and_limit_quality_candidates_node(
 
 
 def _fallback_quality_summary(article: Mapping[str, Any]) -> dict[str, Any]:
-    """评分理由 LLM 不可用时，使用 Worker 已有字段生成保守降级结果。"""
+    """评分理由 LLM 不可用时，使用 已完成评价字段生成保守降级结果。"""
 
     raw = article.get("score_summary", {})
     if not isinstance(raw, Mapping):
@@ -853,7 +605,7 @@ def summarize_quality_reasons_node(
     *,
     batch_size: int = 10,
 ):
-    """让 LLM 归纳评分理由；失败时回退到 Worker 已有结构化理由。"""
+    """整理已有评分理由；可选摘要器失败时保留原始理由。"""
 
     if batch_size < 1:
         raise ValueError("评分理由整理 batch_size 必须大于 0")
@@ -943,9 +695,7 @@ def quality_evaluation_exit_node(
                     "composite_score": article["score"][
                         "composite_score"
                     ],
-                    "coverage_contribution_score": float(
-                        article.get("coverage_contribution_score", 0.0)
-                    ),
+                    "coverage_contribution_score": article.get("coverage_contribution_score"),
                     "quality_summary": article.get(
                         "quality_summary",
                         _fallback_quality_summary(article),
@@ -957,6 +707,7 @@ def quality_evaluation_exit_node(
                 )
             ],
             "portfolio_evaluation": state.get("portfolio_evaluation"),
+            "portfolio_degraded": bool(state.get("portfolio_degraded", False)),
             "quality_reason_failures": list(
                 state.get("quality_reason_failures", [])
             ),
@@ -979,164 +730,84 @@ def quality_evaluation_exit_node(
     return exit_node
 
 
-def _quality_node_input_metrics(
-    name: str,
-    state: Mapping[str, Any],
-) -> dict[str, Any]:
-    return {
-        "task_id": state.get("task_id"),
-        "node": name,
-        "search_result_count": len(state.get("search_results", [])),
-        "quality_group_count": len(state.get("quality_groups", [])),
-        "quality_batch_count": len(state.get("quality_batches", [])),
-        "completed_batch_count": sum(
-            batch.get("status") == "completed"
-            for batch in state.get("quality_batch_results", [])
-            if isinstance(batch, Mapping)
-        ),
-        "failed_batch_count": len(state.get("quality_batch_failures", [])),
-    }
-
-
-def _quality_node_output_metrics(
-    name: str,
-    result: Any,
-) -> dict[str, Any]:
-    if not isinstance(result, Mapping):
-        return {"node": name, "result_type": type(result).__name__}
-    return {
-        "node": name,
-        "task_stage": result.get("task_stage"),
-        "group_count": len(result.get("quality_groups", [])),
-        "batch_count": len(result.get("quality_batches", [])),
-        "batch_result_count": len(result.get("quality_batch_results", [])),
-        "batch_failure_count": len(result.get("quality_batch_failures", [])),
-        "batches_timed_out": bool(result.get("quality_batches_timed_out", False)),
-        "retained_article_count": len(result.get("retained_articles", [])),
-        "excluded_article_count": len(result.get("excluded_articles", [])),
-        "ranked_article_count": len(result.get("ranked_articles", [])),
-        "truncated_candidate_count": len(result.get("truncated_candidates", [])),
-        "quality_candidates_truncated": bool(
-            result.get("quality_candidates_truncated", False)
-        ),
-        "reason_failure_count": len(result.get("quality_reason_failures", [])),
-        "screening_threshold": result.get("quality_screening_threshold"),
-    }
-
-
 def build_quality_evaluation_subgraph(
     *,
+    evaluator_runtime: Any,
+    batch_repository: Any,
     work_cache: RedisWorkCache | None = None,
-    max_batch_size: int = 5,
     checkpointer: Any | None = None,
-    dispatcher: QualityBatchDispatcher | None = None,
-    batch_repository: Any | None = None,
-    reader: QualityBatchReader | None = None,
     hydrator: QualityBatchHydrator | None = None,
     reason_summarizer: QualityReasonSummarizer | None = None,
     screening_threshold: float = 3.0,
     max_candidates_before_truncation: int = 50,
     max_candidates_for_summarizer: int = 25,
     reason_summary_batch_size: int = 10,
-    poll_interval_seconds: float = 2.0,
-    max_poll_interval_seconds: float = 10.0,
-    wait_timeout_seconds: float = 900.0,
+    expert_concurrency: int = 5,
     parent_success_node: str | None = None,
     parent_timeout_node: str | None = None,
     langfuse_runtime: LangfuseRuntime | None = None,
 ):
-    """编译质量评估子图的分组、批次提交和结果读取阶段。
+    """一个应用图共享一个请求限流器；同类型文章也可同时运行。"""
+    from .specialized_evaluators import create_specialized_expert_node
 
-    ``dispatcher`` 与 ``reader`` 用于测试替换；生产环境默认分别使用
-    Celery Broker 和 PostgreSQL 批次表。
-    """
-
-    def add_observed_node(name: str, node: Callable[..., Any]) -> None:
-        if langfuse_runtime is None:
-            graph.add_node(name, node)
-            return
-        graph.add_node(
-            name,
-            langfuse_runtime.wrap_node(
-                name=name.replace("_", "-"),
-                as_type="agent" if name == "submit_quality_batches" else "chain",
-                node=node,
-                input_metrics=lambda state: _quality_node_input_metrics(name, state),
-                output_metrics=lambda result: _quality_node_output_metrics(name, result),
-            ),
-        )
-
-    graph = StateGraph(QualityEvaluationSubgraphState)
-    add_observed_node("quality_grouping", quality_grouping_node(work_cache))
-    add_observed_node(
-        "quality_batcher",
-        quality_batcher_node(max_batch_size=max_batch_size),
+    if evaluator_runtime is None or batch_repository is None:
+        raise ValueError("质量评估需要 evaluator_runtime 和 batch_repository")
+    if int(os.getenv("QUALITY_BATCH_SIZE", "1")) != 1:
+        raise ValueError("单篇评估要求 QUALITY_BATCH_SIZE=1")
+    concurrency = int(os.getenv("QUALITY_EXPERT_CONCURRENCY", str(expert_concurrency)))
+    executor = BatchExecutor(
+        evaluator_runtime, batch_repository, ModelRequestLimiter(concurrency),
+        threshold=screening_threshold,
     )
+    portfolio_concurrency = int(os.getenv("QUALITY_PORTFOLIO_CONCURRENCY", "1"))
+    portfolio_deadline = float(os.getenv("QUALITY_PORTFOLIO_DEADLINE_SECONDS", "90"))
+    portfolio_executor = BatchExecutor(
+        evaluator_runtime, batch_repository, ModelRequestLimiter(portfolio_concurrency),
+        threshold=screening_threshold, deadline_seconds=portfolio_deadline,
+    )
+    graph = StateGraph(QualityEvaluationSubgraphState)
+
+    def add(name: str, node: Callable[..., Any]) -> None:
+        if langfuse_runtime is not None:
+            node = langfuse_runtime.wrap_node(
+                name=name.replace("_", "-"), as_type="chain", node=node,
+                input_metrics=lambda state: {"task_id": state.get("task_id")},
+                output_metrics=lambda result: (
+                    {"stage": result.get("task_stage")} if isinstance(result, dict) else {}
+                ),
+            )
+        graph.add_node(name, node)
+
+    add("quality_grouping", quality_grouping_node(work_cache))
+    add("quality_batcher", quality_batcher_node())
+    add("prepare_quality_plan", prepare_quality_plan_node(
+        evaluator_runtime, batch_repository, hydrator,
+    ))
+    for kind in StudyType:
+        add(f"expert_{kind.value}", create_specialized_expert_node(kind, executor))
+        graph.add_edge(f"expert_{kind.value}", "collect_expert_results")
+    add("collect_expert_results", collect_expert_results_node(batch_repository))
+    add("organize_quality_results", organize_quality_results_node(threshold=screening_threshold))
+    add("evaluate_portfolio", evaluate_portfolio_node(portfolio_executor, batch_repository))
+    add("rank_and_limit_quality_candidates", rank_and_limit_quality_candidates_node(
+        max_candidates_before_truncation=max_candidates_before_truncation,
+        max_candidates_for_summarizer=max_candidates_for_summarizer,
+    ))
+    add("summarize_quality_reasons", summarize_quality_reasons_node(
+        summarizer=reason_summarizer, batch_size=reason_summary_batch_size,
+    ))
+    add("quality_evaluation_exit", quality_evaluation_exit_node(
+        parent_success_node=parent_success_node, parent_timeout_node=parent_timeout_node,
+    ))
     graph.add_edge(START, "quality_grouping")
     graph.add_edge("quality_grouping", "quality_batcher")
-    add_observed_node(
-        "submit_quality_batches",
-        submit_quality_batches_node(dispatcher, batch_repository),
-    )
-    add_observed_node(
-        "poll_quality_batches",
-        poll_quality_batches_node(
-            reader,
-            poll_interval_seconds=poll_interval_seconds,
-            max_poll_interval_seconds=max_poll_interval_seconds,
-            timeout_seconds=wait_timeout_seconds,
-        ),
-    )
-    add_observed_node(
-        "organize_quality_results",
-        organize_quality_results_node(
-            hydrator=hydrator,
-            threshold=screening_threshold,
-        ),
-    )
-    add_observed_node(
-        "rank_and_limit_quality_candidates",
-        rank_and_limit_quality_candidates_node(
-            max_candidates_before_truncation=max_candidates_before_truncation,
-            max_candidates_for_summarizer=max_candidates_for_summarizer,
-        ),
-    )
-    add_observed_node(
-        "summarize_quality_reasons",
-        summarize_quality_reasons_node(
-            reason_summarizer,
-            batch_size=reason_summary_batch_size,
-        ),
-    )
-    add_observed_node(
-        "quality_evaluation_exit",
-        quality_evaluation_exit_node(
-            parent_success_node=parent_success_node,
-            parent_timeout_node=parent_timeout_node,
-        ),
-    )
-    graph.add_edge("quality_batcher", "submit_quality_batches")
-    graph.add_edge("submit_quality_batches", "poll_quality_batches")
-    graph.add_edge("poll_quality_batches", "organize_quality_results")
-    graph.add_edge("organize_quality_results", "rank_and_limit_quality_candidates")
-    graph.add_edge(
-        "rank_and_limit_quality_candidates",
-        "summarize_quality_reasons",
-    )
-    graph.add_edge("summarize_quality_reasons", "quality_evaluation_exit")
-    graph.add_edge("quality_evaluation_exit", END)
+    graph.add_edge("quality_batcher", "prepare_quality_plan")
+    graph.add_conditional_edges("prepare_quality_plan", fork_quality_experts())
+    flow = [
+        "organize_quality_results", "evaluate_portfolio",
+        "rank_and_limit_quality_candidates", "summarize_quality_reasons",
+        "quality_evaluation_exit", END,
+    ]
+    for source, target in zip(flow, flow[1:]):
+        graph.add_edge(source, target)
     return graph.compile(checkpointer=checkpointer)
-
-
-__all__ = [
-    "QualityEvaluationSubgraphState",
-    "group_quality_articles",
-    "quality_grouping_node",
-    "quality_batcher_node",
-    "rank_and_limit_quality_candidates_node",
-    "summarize_quality_reasons_node",
-    "build_quality_evaluation_subgraph",
-    "record_article_id",
-    "split_quality_batch",
-    "study_group_id",
-]

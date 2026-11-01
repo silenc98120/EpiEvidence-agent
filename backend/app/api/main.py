@@ -21,7 +21,7 @@ from backend.app.api.routes import create_router
 from backend.app.api.openai_compat import create_openai_router
 from backend.app.api.services.event_broker import EventBroker
 from backend.app.db import ManagedSessionFactory, ResearchTaskRepository
-from backend.app.db.repositories import ConversationRepository
+from backend.app.db.repositories import ConversationRepository, QualityEvaluationBatchRepository
 from backend.app.observability import LangfuseRuntime
 from backend.app.runtime import (
     TaskCoordinator,
@@ -98,7 +98,7 @@ async def _simple_chat_response(query: str) -> str:
 
 @asynccontextmanager
 async def _application_lifespan(app: FastAPI):
-    """在应用退出前导出尚未批量发送的 Langfuse observation。"""
+    """在应用生命周期中管理模型预加载与退出前资源清理。"""
 
     try:
         checkpoint_graph_builder = getattr(
@@ -174,7 +174,7 @@ def create_app(
         ``coordinator`` 是可注入的，以便部署代码可以提供使用 PostgreSQL LangGraph 检查点编译的 graph；
         ``graph_builder`` 在 Langfuse client 初始化后接收共享运行时依赖，用于构造
         带有节点观测与 LangChain tracing 的完整主图。
-        ``task_persistence`` 保存跨 API、图与 Celery Worker 共用的任务事实；默认测试
+        ``task_persistence`` 保存跨 API、图与质量评估子图共用的任务事实；默认测试
         应用可以省略它，完整默认应用必须提供。
     """
 
@@ -220,6 +220,7 @@ def create_app(
         intent_recognizer=intent_recognizer,
         simple_chat_responder=simple_chat_responder,
         conversation_store=conversation_store,
+        quality_repository=QualityEvaluationBatchRepository(database_session_factory) if database_session_factory is not None else None,
     )
     app = FastAPI(
         title="EpiEvidence Research API",

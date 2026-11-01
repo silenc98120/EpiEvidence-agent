@@ -20,6 +20,8 @@ class EventBroker:
     async def publish(self, event: AGUIEvent) -> None:
         """Publish an event without blocking on a slow subscriber."""
 
+        if event.type == AGUIEventType.RUN_STARTED:
+            self._terminal_events.pop(event.task_id, None)
         if event.type in {
             AGUIEventType.RUN_ERROR,
             AGUIEventType.RUN_FINISHED,

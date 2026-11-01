@@ -63,4 +63,5 @@ def build_public_result(state: Mapping[str, Any]) -> PublicResearchResult:
         conflict_summary=conflict_summary,
         no_recommendation_reason=no_recommendation_reason,
         search_overview=dict(search_overview),
+        quality_evaluation_failures=list(state.get("quality_evaluation_failures", raw_summary.get("quality_evaluation_failures", []))),
     )

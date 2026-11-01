@@ -52,15 +52,9 @@ class EvidenceState(MessagesState):
     # 按研究类型形成的质量评价分组
     article_groups: dict[str, list[str]]
     quality_groups: list[dict[str, Any]]
-    # 按研究类型切割后的 Celery 质量评估批次
+    # 按研究类型切割后的质量评估批次
     quality_batches: list[dict[str, Any]]
-    # 每个质量评价 Send 分支的结果，质量评价 fan-in 节点消费该字段
-    quality_evaluation_results: Annotated[list[dict[str, Any]], add]
     quality_evaluation_failures: list[dict[str, Any]]
-    # 评价结果；保留旧字段名称以兼容已有调用方
-    evaluated_evidence: list[dict[str, Any]]
-    # Evaluator 通过结构校验后由程序计算的派生分数
-    scored_assessments: list[dict[str, Any]]
     excluded_candidates: list[dict[str, Any]]
     retained_candidates: list[dict[str, Any]]
     # 集合级覆盖评价和确定性排序结果

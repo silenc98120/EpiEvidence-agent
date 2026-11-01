@@ -26,12 +26,18 @@ from backend.app.core.search_results_normalizer import (
 )
 from backend.app.core.search_strategy_generator import SearchPlanBuilder, SearchSource
 from backend.app.core.search_source_selector import SearchSourceSelector
-from backend.app.core.llm_provider import create_embedding_client, normalize_openai_base_url
+from backend.app.core.llm_provider import (
+    create_embedding_client,
+    create_eval_chat_model,
+    normalize_openai_base_url,
+)
 from backend.app.db.repositories import ArticleEmbeddingRepository, SearchResultsRepository
 from backend.app.db.repositories.quality_evaluation_results import QualityEvaluationBatchRepository
 from backend.app.db.session import build_session_factory
 from backend.app.observability import LangfuseRuntime
 
+from backend.skills.quality_evaluator.evaluator import QualityEvaluatorRuntime
+from backend.skills.quality_evaluator.repository import ArticleRepository
 from backend.agent.nodes import (
     SearchBackend,
     default_search_backends as build_search_backends,
@@ -44,11 +50,6 @@ from backend.agent.nodes import (
     search_source_node,
     search_results_fan_in_node,
     quality_candidate_selection_node,
-    group_articles_node,
-    quality_batcher_node,
-    quality_group_router,
-    quality_evaluator_node,
-    quality_evaluation_fan_in_node,
     evidence_summarizer_node,
 )
 from backend.agent.subgraphs.quality_evaluation import (
@@ -123,7 +124,6 @@ def build_evidence_graph(
     mesh_normalizer: MeshNormalizer | None = None,
     search_plan_builder: SearchPlanBuilder | None = None,
     search_source_selector: SearchSourceSelector | None = None,
-    quality_evaluator: Any | None = None,
     evidence_summarizer: Any | None = None,
     result_normalizer: SearchResultsNormalizer | None = None,
     deduplicator: Deduplicator | None = None,
@@ -131,21 +131,17 @@ def build_evidence_graph(
     persistence: Any | None = None,
     checkpointer: Any | None = None,
     quality_evaluation_subgraph: Any | None = None,
-    quality_batch_dispatcher: Any | None = None,
     quality_batch_repository: Any | None = None,
-    quality_batch_reader: Any | None = None,
     quality_batch_hydrator: Any | None = None,
     quality_reason_summarizer: Any | None = None,
     quality_max_candidates_before_truncation: int = 50,
     quality_max_candidates_for_summarizer: int = 25,
     quality_reason_summary_batch_size: int = 10,
-    quality_poll_interval_seconds: float = 2.0,
-    quality_max_poll_interval_seconds: float = 10.0,
-    quality_wait_timeout_seconds: float = 900.0,
     embedding_client: Any | None = None,
     article_embedding_store: Any | None = None,
     quality_candidate_report_directory: Path | None = None,
     quality_candidate_limit: int = 50,
+    evaluator_runtime: Any | None = None,
     langfuse_runtime: LangfuseRuntime | None = None,
 ):
     """构建完整的检索、分组和质量评价图。
@@ -209,58 +205,23 @@ def build_evidence_graph(
                 langfuse_runtime=langfuse_runtime,
             ),
         )
-    use_quality_subgraph = quality_evaluator is None
-    if use_quality_subgraph:
-        compiled_quality_subgraph = quality_evaluation_subgraph
-        if compiled_quality_subgraph is None:
-            compiled_quality_subgraph = build_quality_evaluation_subgraph(
-                work_cache=work_cache,
-                checkpointer=None,
-                dispatcher=quality_batch_dispatcher,
-                batch_repository=quality_batch_repository,
-                reader=quality_batch_reader,
-                hydrator=quality_batch_hydrator,
-                reason_summarizer=quality_reason_summarizer,
-                max_candidates_before_truncation=(
-                    quality_max_candidates_before_truncation
-                ),
-                max_candidates_for_summarizer=quality_max_candidates_for_summarizer,
-                reason_summary_batch_size=quality_reason_summary_batch_size,
-                poll_interval_seconds=quality_poll_interval_seconds,
-                max_poll_interval_seconds=quality_max_poll_interval_seconds,
-                wait_timeout_seconds=quality_wait_timeout_seconds,
-                parent_success_node="evidence_summarizer",
-                parent_timeout_node="evidence_summarizer",
-                langfuse_runtime=langfuse_runtime,
-            )
-        graph.add_node(
-            "quality_evaluation",
-            compiled_quality_subgraph,
+    compiled_quality_subgraph = quality_evaluation_subgraph
+    if compiled_quality_subgraph is None:
+        compiled_quality_subgraph = build_quality_evaluation_subgraph(
+            work_cache=work_cache,
+            checkpointer=None,
+            evaluator_runtime=evaluator_runtime,
+            batch_repository=quality_batch_repository,
+            hydrator=quality_batch_hydrator,
+            reason_summarizer=quality_reason_summarizer,
+            max_candidates_before_truncation=quality_max_candidates_before_truncation,
+            max_candidates_for_summarizer=quality_max_candidates_for_summarizer,
+            reason_summary_batch_size=quality_reason_summary_batch_size,
+            parent_success_node="evidence_summarizer",
+            parent_timeout_node="evidence_summarizer",
+            langfuse_runtime=langfuse_runtime,
         )
-    else:
-        graph.add_node(
-            "group_articles",
-            group_articles_node(work_cache, langfuse_runtime),
-        )
-        graph.add_node(
-            "quality_batcher",
-            quality_batcher_node(langfuse_runtime=langfuse_runtime),
-        )
-        graph.add_node(
-            "quality_evaluator",
-            quality_evaluator_node(
-                quality_evaluator,
-                langfuse_runtime=langfuse_runtime,
-            ),
-        )
-        graph.add_node(
-            "quality_evaluation_fan_in",
-            quality_evaluation_fan_in_node(
-                work_cache,
-                evaluator=quality_evaluator,
-                langfuse_runtime=langfuse_runtime,
-            ),
-        )
+    graph.add_node("quality_evaluation", compiled_quality_subgraph)
     graph.add_node(
         "evidence_summarizer",
         evidence_summarizer_node(
@@ -304,24 +265,13 @@ def build_evidence_graph(
         search_fanout_node(backends, langfuse_runtime),
     )
     graph.add_edge("search_source", "search_results_fan_in")
-    if use_quality_subgraph:
-        graph.add_edge(
-            "search_results_fan_in",
-            "quality_candidate_selection"
-            if embedding_client is not None
-            else "quality_evaluation",
-        )
-        if embedding_client is not None:
-            graph.add_edge("quality_candidate_selection", "quality_evaluation")
-    else:
-        graph.add_edge("search_results_fan_in", "group_articles")
-        graph.add_edge("group_articles", "quality_batcher")
-        graph.add_conditional_edges(
-            "quality_batcher",
-            quality_group_router(),
-        )
-        graph.add_edge("quality_evaluator", "quality_evaluation_fan_in")
-        graph.add_edge("quality_evaluation_fan_in", "evidence_summarizer")
+    graph.add_edge(
+        "search_results_fan_in",
+        "quality_candidate_selection" if embedding_client is not None else "quality_evaluation",
+    )
+    if embedding_client is not None:
+        graph.add_edge("quality_candidate_selection", "quality_evaluation")
+    graph.add_edge("quality_evaluation", "evidence_summarizer")
     graph.add_edge("evidence_summarizer", END)
     return graph.compile(checkpointer=checkpointer)
 
@@ -377,10 +327,19 @@ def build_application_graph(
     search_results_repository = SearchResultsRepository(active_session_factory)
     article_embedding_repository = ArticleEmbeddingRepository(active_session_factory)
     quality_batch_repository = QualityEvaluationBatchRepository(active_session_factory)
+    article_repository = ArticleRepository(active_session_factory)
+    eval_model = create_eval_chat_model()
+    evaluator_runtime = QualityEvaluatorRuntime(
+        model=eval_model,
+        repository=article_repository,
+        callbacks=[langfuse_runtime.callback_handler] if langfuse_runtime and langfuse_runtime.callback_handler else [],
+    )
+    work_cache = RedisWorkCache()
     embedding_client = create_embedding_client()
     evidence_summarizer = EvidenceSummarizer(
         model=model,
         repository=SummarizerRepository(active_session_factory),
+        callbacks=[langfuse_runtime.callback_handler] if langfuse_runtime and langfuse_runtime.callback_handler else [],
     )
 
     compiled_graph = build_runtime_evidence_graph(
@@ -389,7 +348,10 @@ def build_application_graph(
         article_embedding_store=article_embedding_repository,
         evidence_summarizer=evidence_summarizer,
         quality_batch_repository=quality_batch_repository,
+        evaluator_runtime=evaluator_runtime,
+        work_cache=work_cache,
         embedding_client=embedding_client,
+        quality_candidate_limit=int(os.getenv("QUALITY_CANDIDATE_LIMIT", "20")),
         checkpointer=checkpointer,
     )
     # FastAPI lifespan 通过该私有资源句柄完成模型预加载和关闭；图本身只消费 Adapter。

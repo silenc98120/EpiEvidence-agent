@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -16,12 +17,14 @@ from sqlalchemy import select
 
 from backend.app.db import ArticleORM, FullTextResourceORM, TaskORM
 from backend.app.prompts.evidence_summarizer_prompt_template import (
+    BATCH_RECOMMENDATION_SYSTEM_PROMPT,
     EVIDENCE_SUMMARIZER_SYSTEM_PROMPT,
+    REDUCE_SUMMARIZER_SYSTEM_PROMPT,
 )
 
 
 class _StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
 
 class RecommendationOutput(_StrictModel):
@@ -32,10 +35,31 @@ class RecommendationOutput(_StrictModel):
     recommendation_reason: str = Field(min_length=1, max_length=800)
 
 
+class BatchRecommendationOutput(_StrictModel):
+    """单个候选切片批次的推荐评价契约。"""
+
+    batch_index: int = Field(ge=0)
+    selected_article_ids: list[UUID] = Field(default_factory=list, max_length=3)
+    recommendations: list[RecommendationOutput] = Field(default_factory=list, max_length=3)
+    batch_summary: str | None = Field(default=None, max_length=800)
+
+    @model_validator(mode="after")
+    def validate_batch_alignment(self) -> "BatchRecommendationOutput":
+        selected = self.selected_article_ids
+        rec_ids = [item.article_id for item in self.recommendations]
+        if len(selected) != len(set(selected)):
+            raise ValueError("selected_article_ids 不能重复")
+        if len(rec_ids) != len(set(rec_ids)):
+            raise ValueError("recommendations 的 article_id 不能重复")
+        if set(selected) != set(rec_ids):
+            raise ValueError("recommendations 必须完整覆盖 selected_article_ids")
+        return self
+
+
 class SummarizerOutput(_StrictModel):
     """Summarizer 唯一的结构化 LLM 输出契约。"""
 
-    task_id: str = Field(min_length=1)
+    task_id: str = Field(default="", min_length=0)
     selected_article_ids: list[UUID] = Field(default_factory=list, max_length=10)
     recommendations: list[RecommendationOutput] = Field(default_factory=list, max_length=10)
     overall_summary: str = Field(min_length=1, max_length=2400)
@@ -260,17 +284,59 @@ class EvidenceSummarizer:
         model: Any,
         repository: SummarizerRepository,
         system_prompt: str = EVIDENCE_SUMMARIZER_SYSTEM_PROMPT,
+        batch_system_prompt: str = BATCH_RECOMMENDATION_SYSTEM_PROMPT,
+        reduce_system_prompt: str = REDUCE_SUMMARIZER_SYSTEM_PROMPT,
         max_attempts: int = 2,
+        map_threshold: int = 6,
+        map_batch_size: int = 3,
+        max_map_candidates: int = 24,
+        callbacks: Sequence[Any] = (),
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts 必须至少为 1")
-        self._structured_model = model.with_structured_output(
-            SummarizerOutput,
-            include_raw=True,
-        )
+        if map_batch_size < 1:
+            raise ValueError("map_batch_size 必须至少为 1")
+        self.model = model
+        try:
+            self._structured_model = model.with_structured_output(
+                SummarizerOutput,
+                method="json_mode",
+                include_raw=True,
+            )
+        except (TypeError, ValueError):
+            self._structured_model = model.with_structured_output(
+                SummarizerOutput,
+                include_raw=True,
+            )
+        self.callbacks = list(callbacks)
+        if self.callbacks:
+            self._structured_model = self._structured_model.with_config(callbacks=self.callbacks)
+        self._batch_structured_model: Any | None = None
         self.repository = repository
         self.system_prompt = system_prompt
+        self.batch_system_prompt = batch_system_prompt
+        self.reduce_system_prompt = reduce_system_prompt
         self.max_attempts = max_attempts
+        self.map_threshold = map_threshold
+        self.map_batch_size = map_batch_size
+        self.max_map_candidates = max_map_candidates
+
+    def _get_batch_model(self) -> Any:
+        if self._batch_structured_model is None:
+            try:
+                self._batch_structured_model = self.model.with_structured_output(
+                    BatchRecommendationOutput,
+                    method="json_mode",
+                    include_raw=True,
+                )
+            except (TypeError, ValueError):
+                self._batch_structured_model = self.model.with_structured_output(
+                    BatchRecommendationOutput,
+                    include_raw=True,
+                )
+            if self.callbacks:
+                self._batch_structured_model = self._batch_structured_model.with_config(callbacks=self.callbacks)
+        return self._batch_structured_model
 
     async def summarize(
         self,
@@ -281,6 +347,7 @@ class EvidenceSummarizer:
         portfolio_evaluation: Mapping[str, Any] | None,
         ranked_candidates: Sequence[Mapping[str, Any]],
         search_metrics: Mapping[str, Any],
+        quality_evaluation_failures: Sequence[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
         query = user_query.strip()
         candidate_ids = validate_summarizer_input(
@@ -294,6 +361,7 @@ class EvidenceSummarizer:
                 user_query=query,
                 search_metrics=search_metrics,
             )
+            summary["quality_evaluation_failures"] = list(quality_evaluation_failures)
             await self.repository.persist_final_summary(task_id=task_id, summary=summary)
             return summary
 
@@ -311,15 +379,25 @@ class EvidenceSummarizer:
             )
             for rank, article_id in enumerate(candidate_ids, start=1)
         ]
-        output = await self._invoke(
-            {
-                "task_id": task_id,
-                "user_query": query,
-                "intent_analysis": dict(intent_analysis),
-                "portfolio_evaluation": dict(portfolio_evaluation or {}),
-                "ranked_candidates": candidate_payload,
-            }
-        )
+
+        if len(candidate_payload) <= self.map_threshold:
+            output = await self._invoke(
+                {
+                    "task_id": task_id,
+                    "user_query": query,
+                    "intent_analysis": dict(intent_analysis),
+                    "portfolio_evaluation": dict(portfolio_evaluation or {}),
+                    "ranked_candidates": candidate_payload,
+                }
+            )
+        else:
+            output = await self._invoke_map_reduce(
+                task_id=task_id,
+                user_query=query,
+                intent_analysis=intent_analysis,
+                portfolio_evaluation=portfolio_evaluation,
+                candidate_payload=candidate_payload,
+            )
         if output.task_id != task_id:
             raise ValueError("Summarizer 输出 task_id 与输入不一致")
         selected_ids = set(output.selected_article_ids)
@@ -354,6 +432,7 @@ class EvidenceSummarizer:
             ],
             "recommendations": recommendations,
         }
+        summary["quality_evaluation_failures"] = list(quality_evaluation_failures)
         await self.repository.persist_final_summary(task_id=task_id, summary=summary)
         return summary
 
@@ -373,9 +452,7 @@ class EvidenceSummarizer:
             **article_payload,
             "rank": rank,
             "composite_score": float(candidate["composite_score"]),
-            "coverage_contribution_score": float(
-                candidate.get("coverage_contribution_score", 0.0)
-            ),
+            "coverage_contribution_score": candidate.get("coverage_contribution_score"),
             "quality_summary": dict(candidate["quality_summary"]),
         }
 
@@ -406,17 +483,21 @@ class EvidenceSummarizer:
                 else None
             ),
             "composite_score": float(candidate["composite_score"]),
-            "coverage_contribution_score": float(
-                candidate.get("coverage_contribution_score", 0.0)
-            ),
+            "coverage_contribution_score": candidate.get("coverage_contribution_score"),
             "quality_summary": dict(candidate["quality_summary"]),
             "abstract_summary": generated.abstract_summary,
             "recommendation_reason": generated.recommendation_reason,
         }
 
-    async def _invoke(self, payload: Mapping[str, Any]) -> SummarizerOutput:
+    async def _invoke(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        system_prompt: str | None = None,
+    ) -> SummarizerOutput:
+        prompt = system_prompt or self.system_prompt
         messages = [
-            SystemMessage(content=self.system_prompt),
+            SystemMessage(content=prompt),
             HumanMessage(content=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
         ]
         last_error: Exception | None = None
@@ -425,20 +506,32 @@ class EvidenceSummarizer:
             try:
                 response = await self._structured_model.ainvoke(messages)
                 latency_ms = (perf_counter() - started) * 1000
+                raw = None
                 if isinstance(response, SummarizerOutput):
                     result = response
-                    raw = None
                 else:
                     parsing_error = response.get("parsing_error")
                     parsed = response.get("parsed")
-                    if parsing_error is not None or parsed is None:
+                    raw = response.get("raw")
+                    if parsed is None and raw is not None:
+                        from backend.skills.quality_evaluator.evaluator import _extract_json_from_aimessage
+                        extracted = _extract_json_from_aimessage(raw)
+                        if extracted and isinstance(extracted, dict):
+                            if not extracted.get("task_id") and payload.get("task_id"):
+                                extracted["task_id"] = str(payload["task_id"])
+                            try:
+                                parsed = SummarizerOutput.model_validate(extracted)
+                            except Exception:
+                                pass
+                    if parsed is None:
                         raise ValueError("Summarizer 结构化输出校验失败") from parsing_error
                     result = (
                         parsed
                         if isinstance(parsed, SummarizerOutput)
                         else SummarizerOutput.model_validate(parsed)
                     )
-                    raw = response.get("raw")
+                if not result.task_id and payload.get("task_id"):
+                    result.task_id = str(payload["task_id"])
                 usage = getattr(raw, "usage_metadata", None) if raw is not None else None
                 if raw is not None and not usage:
                     usage = getattr(raw, "response_metadata", {}).get("token_usage", {})
@@ -458,8 +551,170 @@ class EvidenceSummarizer:
                     event="summarization_attempt_failed",
                     attempt=attempt,
                     error_type=type(exc).__name__,
-                ).warning("最终文献推荐整理尝试失败")
+                    error_str=str(exc),
+                ).warning("最终文献推荐整理尝试失败: {}", exc)
         raise RuntimeError(f"Summarizer 在 {self.max_attempts} 次尝试后仍失败") from last_error
+
+    async def _invoke_batch(
+        self,
+        *,
+        batch_index: int,
+        task_id: str,
+        user_query: str,
+        intent_analysis: Mapping[str, Any],
+        batch_candidates: Sequence[Mapping[str, Any]],
+    ) -> BatchRecommendationOutput:
+        """对一个批次（通常 3 篇，可包含不同研究类型）执行批内推荐评价。"""
+        if not batch_candidates:
+            return BatchRecommendationOutput(batch_index=batch_index)
+
+        payload = {
+            "batch_index": batch_index,
+            "task_id": task_id,
+            "user_query": user_query,
+            "intent_analysis": dict(intent_analysis),
+            "candidates": list(batch_candidates),
+        }
+        messages = [
+            SystemMessage(content=self.batch_system_prompt),
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
+        ]
+        batch_model = self._get_batch_model()
+        batch_uuids = {UUID(str(c["article_id"])) for c in batch_candidates}
+
+        for attempt in range(1, self.max_attempts + 1):
+            started = perf_counter()
+            try:
+                response = await batch_model.ainvoke(messages)
+                latency_ms = (perf_counter() - started) * 1000
+                if isinstance(response, BatchRecommendationOutput):
+                    result = response
+                else:
+                    parsing_error = response.get("parsing_error")
+                    parsed = response.get("parsed")
+                    if parsing_error is not None or parsed is None:
+                        raise ValueError("Batch 结构化输出校验失败") from parsing_error
+                    result = (
+                        parsed
+                        if isinstance(parsed, BatchRecommendationOutput)
+                        else BatchRecommendationOutput.model_validate(parsed)
+                    )
+
+                valid_selected = [aid for aid in result.selected_article_ids if aid in batch_uuids]
+                valid_recs = [r for r in result.recommendations if r.article_id in set(valid_selected)]
+                sanitized = BatchRecommendationOutput(
+                    batch_index=batch_index,
+                    selected_article_ids=valid_selected,
+                    recommendations=valid_recs,
+                    batch_summary=result.batch_summary,
+                )
+                logger.bind(
+                    component="evidence_summarizer",
+                    event="batch_recommendation_completed",
+                    batch_index=batch_index,
+                    candidate_count=len(batch_candidates),
+                    selected_count=len(sanitized.selected_article_ids),
+                    latency_ms=round(latency_ms, 1),
+                ).info("批次推荐初评完成")
+                return sanitized
+            except Exception as exc:
+                logger.bind(
+                    component="evidence_summarizer",
+                    event="batch_recommendation_attempt_failed",
+                    batch_index=batch_index,
+                    attempt=attempt,
+                    error_type=type(exc).__name__,
+                    error_str=str(exc),
+                ).warning("批次推荐初评尝试失败: {}", exc)
+
+        # 降级兜底：若批次模型调用或解析失败，默认保留该批次综合评分最高的 1 篇
+        fallback_cand = batch_candidates[0]
+        fallback_uuid = UUID(str(fallback_cand["article_id"]))
+        title = fallback_cand.get("title", "该文献")
+        abstract = fallback_cand.get("abstract") or ""
+        abstract_snip = abstract[:200] if abstract else f"{title} 的核心摘要内容。"
+        return BatchRecommendationOutput(
+            batch_index=batch_index,
+            selected_article_ids=[fallback_uuid],
+            recommendations=[
+                RecommendationOutput(
+                    article_id=fallback_uuid,
+                    abstract_summary=abstract_snip,
+                    recommendation_reason="本批次综合评分最高候选，作为代表性研究纳入综合分析。",
+                )
+            ],
+            batch_summary="批次模型调用降级，默认保留最高分候选。",
+        )
+
+    async def _invoke_map_reduce(
+        self,
+        *,
+        task_id: str,
+        user_query: str,
+        intent_analysis: Mapping[str, Any],
+        portfolio_evaluation: Mapping[str, Any] | None,
+        candidate_payload: Sequence[Mapping[str, Any]],
+    ) -> SummarizerOutput:
+        """执行 Map-Reduce 两阶段分批推荐评估与全局汇合。"""
+        # 1. 窗口截断：最多取前 max_map_candidates 篇
+        effective_candidates = list(candidate_payload[: self.max_map_candidates])
+
+        # 2. 按综合排序 3 篇一组切片
+        batches = [
+            effective_candidates[i : i + self.map_batch_size]
+            for i in range(0, len(effective_candidates), self.map_batch_size)
+        ]
+
+        # 3. 并发执行 Map 批次初评
+        batch_tasks = [
+            self._invoke_batch(
+                batch_index=idx,
+                task_id=task_id,
+                user_query=user_query,
+                intent_analysis=intent_analysis,
+                batch_candidates=batch,
+            )
+            for idx, batch in enumerate(batches)
+        ]
+        batch_results: list[BatchRecommendationOutput] = await asyncio.gather(*batch_tasks)
+
+        # 4. 汇合并整理 Map 选出的候选
+        selected_uuids: list[UUID] = []
+        batch_rec_by_uuid: dict[UUID, RecommendationOutput] = {}
+        for b_res in batch_results:
+            for aid in b_res.selected_article_ids:
+                if aid not in selected_uuids:
+                    selected_uuids.append(aid)
+            for rec in b_res.recommendations:
+                batch_rec_by_uuid[rec.article_id] = rec
+
+        # 若所有批次均未选中，至少取前 3 篇保底
+        if not selected_uuids:
+            for cand in effective_candidates[:3]:
+                c_uuid = UUID(str(cand["article_id"]))
+                selected_uuids.append(c_uuid)
+
+        cand_map = {UUID(str(c["article_id"])): c for c in effective_candidates}
+        pooled_candidates = []
+        for aid in selected_uuids:
+            if aid in cand_map:
+                cand = dict(cand_map[aid])
+                if aid in batch_rec_by_uuid:
+                    cand["preliminary_abstract_summary"] = batch_rec_by_uuid[aid].abstract_summary
+                    cand["preliminary_recommendation_reason"] = (
+                        batch_rec_by_uuid[aid].recommendation_reason
+                    )
+                pooled_candidates.append(cand)
+
+        # 5. Reduce 阶段：调用全局汇合模型
+        reduce_payload = {
+            "task_id": task_id,
+            "user_query": user_query,
+            "intent_analysis": dict(intent_analysis),
+            "portfolio_evaluation": dict(portfolio_evaluation or {}),
+            "ranked_candidates": pooled_candidates,
+        }
+        return await self._invoke(reduce_payload, system_prompt=self.reduce_system_prompt)
 
     @staticmethod
     def _empty_summary(
@@ -530,6 +785,8 @@ def render_summary_chat(summary: Mapping[str, Any]) -> str:
     for display_index, article in enumerate(recommendations, start=1):
         if not isinstance(article, Mapping):
             continue
+        coverage = article.get("coverage_contribution_score")
+        coverage_text = f"{coverage:.1f}" if coverage is not None else "未完成评价"
         lines.extend(
             [
                 "",
@@ -538,7 +795,7 @@ def render_summary_chat(summary: Mapping[str, Any]) -> str:
                 f"摘要概括：{article.get('abstract_summary', '')}",
                 f"推荐理由：{article.get('recommendation_reason', '')}",
                 f"摘要阶段综合分：{float(article.get('composite_score', 0.0)):.1f}；"
-                f"集合覆盖贡献分：{float(article.get('coverage_contribution_score', 0.0)):.1f}",
+                f"集合覆盖贡献分：{coverage_text}",
             ]
         )
         quality_summary = article.get("quality_summary", {})
