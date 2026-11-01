@@ -18,6 +18,11 @@ from loguru import logger
 logger.remove()
 logger.add(sys.stderr, level="CRITICAL")
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
 
 TEST_SET_PATH = Path(__file__).resolve().parents[1] / "test_set" / "agent_queries.json"
 PROJECT_ROOT = TEST_SET_PATH.parents[1]
@@ -165,10 +170,9 @@ def main() -> None:
         logger.remove()
         logger.add(
             sys.stderr,
-            level="ERROR",
-            format="{message}",
-            backtrace=False,
-            diagnose=False,
+            level="INFO",
+            backtrace=True,
+            diagnose=True,
         )
     results = asyncio.run(
         run_test_set(

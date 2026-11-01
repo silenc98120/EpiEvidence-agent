@@ -30,7 +30,7 @@ description: 对已标准化、去重并持久化的医学文献按 StudyType �
 
 ## 权威来源
 
-本文件规定执行边界和问题模型；字段、细则和计算逻辑由代码维护：
+本文件规定质量评估专家的定位、评价范围、处理流程和判定规则；字段、细则和计算逻辑由代码维护，不描述任务分发或工作分配：
 
 | 内容 | 权威来源 |
 | --- | --- |
@@ -47,7 +47,7 @@ description: 对已标准化、去重并持久化的医学文献按 StudyType �
 
 ### 1. 校验任务并路由
 
-输入必须符合 `QualityEvaluationJob`：`task_id`、`group_id`、已校验的 `study_type`，以及 1～10 个不重复的 PostgreSQL `articles.article_id` canonical UUID。一个批次只能包含一种研究类型。
+输入必须符合 `QualityEvaluationJob`：`task_id`、`group_id`、已校验的 `study_type`，以及一个 PostgreSQL `articles.article_id` canonical UUID。一个批次只评价一篇文章、一个研究类型。
 
 先校验 `StudyType`，再从固定注册表获取 Rubric。不得使用用户输入构造文件路径、模块路径或 Rubric。研究类型的完整条目必须与注册表和 Schema 一致。
 
@@ -63,14 +63,14 @@ description: 对已标准化、去重并持久化的医学文献按 StudyType �
 
 ### 3. 文章级初筛
 
-每组建议 5～8 篇，最多 10 篇；摘要较长时缩小批次。一次调用可以评价同组文章，但必须逐篇完成以下顺序：
+每次只评价一篇文章，并按以下顺序完成：
 
 1. 根据 `user_query` 判断 population、intervention/exposure、comparator、outcome 和 research direction，输出 relevance `score`、`level` 和 `reason`。
 2. 独立判断摘要是否给出样本量、主要结局、效应方向、效应量、不确定性、关键时间点和结论，输出 `answerability_score` 和 `answerability_reason`。
 3. 按当前 Rubric 覆盖全部 legacy `criterion_id`，并按照问题目录提供的规范顺序评价每项。
 4. 为每篇记录 `strengths`、`limitations`、`evidence_gaps` 和 `confidence`。
 
-同组文章只提供判定尺度的比较背景，不能因另一篇更好而降低某篇的绝对评价。`ArticleAssessmentBatch` 的两个评价列表必须分别完整覆盖输入 UUID，每个 UUID 恰好出现一次。
+不得参考其他文章的相对优劣。`ArticleAssessmentBatch` 的两个评价列表必须分别且仅包含该输入 UUID。
 
 ### 4. 结构化校验与失败
 
@@ -82,7 +82,7 @@ description: 对已标准化、去重并持久化的医学文献按 StudyType �
 - 每个质量状态与固定分值一致；
 - 质量条目完整覆盖当前 Rubric 且无重复。
 
-模型调用或 Schema 校验失败时按运行时重试策略重试。耗尽后返回 `evaluation_failed`、错误类型和原因，不生成分数，不进入重算。已处理或正在处理的批次返回 skipped，不重复计算。
+模型调用或 Schema 校验失败时按运行时重试策略重试。耗尽后返回 `evaluation_failed`、错误类型和原因，不生成分数，不进入重算。
 
 完成条件：成功结果通过 Pydantic 校验；失败结果明确、可诊断且不含伪造评分。
 
@@ -132,7 +132,7 @@ Schema 校验的 Evaluator 条目计算质量与其他派生分，再按现有�
 | --- | ---: | --- |
 | `favorable` | `+1` | 摘要明确、充分支持该问题 |
 | `unclear` | `-0.5` | 有相关信息，但不足以确认是否满足 |
-| `not_reported` | `-1` | 摘要完全没有该问题的信息，`evidence_quote` 固定为“摘要未报告” |
+| `not_reported` | `-1` | 摘要完全没有该问题的信息；模型不提供 span，程序派生 `evidence_quote` 为“摘要未报告” |
 | `not_applicable` | `null` | 该问题确实不适用于当前研究；正例是非 Meta 研究不评价 Meta 异质性，反例是摘要缺失该信息 |
 
 每个问题的具体评价指标、适用范围、`favorable` 正例、`unclear` 边界例和 `not_reported` 反例见 [`quality-question-catalog.md`](references/quality-question-catalog.md)。目录的统一 Rubric 还规定：正例必须支持该单一命题，反例必须说明为什么不能达到该级；`not_applicable` 必须有当前研究不适用的具体理由。`not_applicable` 不能用来掩盖摘要信息缺失。
@@ -192,21 +192,31 @@ quality_evaluation_batches
 
 quality_evaluation_items
   item_id, batch_id, article_id, question_id,
-  status, score, evidence_quote, evidence_source, reason
+  status, score, evidence_span_ids, evidence_source, reason
 ```
 
 推荐唯一键为 `article_id + question_id + rubric_version`。研究类型用于路由和审计，问题身份由 `question_id` 确定。迁移完成前，现有 `criterion_id`、研究类型专属 Schema 和 JSON 快照继续有效；不因目录文档变化而直接改变运行时输出。
 
-## LangGraph 与持久化边界
+## 模型输出边界
 
-LangGraph/worker 负责分组、切批、hydrate、调用、核查、程序重算、fan-in、幂等和持久化；本 Skill 文件不会自动执行。全局 state 只保存必要的结构化阶段产物，不追加摘要正文、完整 Prompt 或模型原始响应。
+只返回调用方绑定的结构化结果，不输出 Markdown 或额外文字。模型调用使用 structured output 传递 Pydantic Schema；Prompt 不重复输出 JSON Schema。相关性和可回答性理由不超过 300 字符，质量条目理由不超过 200 字符；strengths、limitations 和 evidence_gaps 各最多 5 项、每项不超过 120 字符。
+
+常见误判及修正：
+
+- 摘要没有提到某项，不等于研究没有执行或结果不良；标记 `not_reported`，分值为 `-1`，span 为空。
+- 摘要提到相关信息但不足以确认符合标准，标记 `unclear`，引用相关 span，分值为 `-0.5`。
+- 只有确实不适用于该研究的问题才标记 `not_applicable`；信息缺失不能用此状态处理。
+- PRISMA 等报告规范不能证明低偏倚风险；只评价摘要明确报告的方法学信息。
+- 相关性不代表因果性；作者结论不能替代方法学证据。
+
+程序负责证据 span 校验、分数重算、筛选与排序。摘要阶段不能声称完成全文偏倚风险评价。
 
 失败批次保留 `evaluation_failed`、错误类型和可诊断原因，阻止其进入重算和下游汇总。只有结构化校验成功并完成核查/重算的批次才可持久化为成功结果。
 
 ## 完成检查
 
 - [ ] YAML frontmatter 包含有效的 `name` 和可区分触发范围的 `description`，正文目录可导航。
-- [ ] 输入是标准化、去重、持久化的同类型 UUID 批次，hydrate 后 UUID 集合完全匹配。
+- [ ] 输入是标准化、去重、持久化的单篇 UUID 任务，hydrate 后 UUID 完全匹配。
 - [ ] 当前 `study_type` 只使用注册表中的 Rubric 和 legacy `criterion_id`。
 - [ ] 每篇 relevance、answerability 和全部质量条目均有可追溯证据；缺失信息使用正确状态。
 - [ ] 文章级输出符合 `ArticleAssessmentBatch`，集合级输出符合 `PortfolioEvaluation`。

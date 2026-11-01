@@ -12,7 +12,10 @@ from pydantic import ValidationError
 
 from backend.skills.quality_evaluator.rubric_registry import get_rubric
 from backend.skills.quality_evaluator.schema import StudyType, article_assessment_model_for
+from backend.skills.quality_evaluator.schema import PortfolioEvaluation
+from backend.skills.quality_evaluator.evidence import resolve_portfolio_evidence
 from backend.skills.quality_evaluator.scoring import calculate_preliminary_quality
+from backend.app.core.evidence_spans import resolve_span_ids
 
 from ..config import EvaluationConfig
 from ..enums import BatchEligibility, JudgeType
@@ -43,6 +46,31 @@ def check_batch(snapshot: TaskEvaluationSnapshot, batch: Any, config: Evaluation
     issues: list[CheckIssue] = []
     if batch.status != "completed":
         issues.append(_issue("unsupported_status", f"不支持的 Batch status：{batch.status}"))
+
+    if batch.study_type == "portfolio":
+        payload = (batch.input_payload or {}).get("input", {})
+        candidate_articles = payload.get("candidate_articles", [])
+        if not candidate_articles:
+            issues.append(_issue("missing_portfolio_input", "portfolio 批次缺少冻结候选文章输入"))
+        if batch.assessment_payload is None:
+            issues.append(_issue("missing_portfolio_payload", "portfolio assessment_payload 为空"))
+        elif candidate_articles:
+            try:
+                data = resolve_portfolio_evidence(dict(batch.assessment_payload), candidate_articles)
+                evaluation = PortfolioEvaluation.model_validate(data)
+                expected = {str(item["article_id"]) for item in candidate_articles}
+                if {str(item) for item in evaluation.candidate_article_ids} != expected:
+                    issues.append(_issue("portfolio_articles_mismatch", "portfolio 候选文章集合与冻结输入不一致"))
+            except (ValidationError, KeyError, TypeError, ValueError) as exc:
+                issues.append(_issue("invalid_portfolio_payload", str(exc)))
+        return BatchCheckResult(
+            batch_id=batch.batch_id,
+            classification=BatchEligibility.INVALID if issues else BatchEligibility.ELIGIBLE,
+            article_count=len(batch.article_ids),
+            issues=issues,
+            rubric_contract_version=None,
+            rubric_sha256=None,
+        )
     if not batch.article_ids:
         issues.append(_issue("empty_article_ids", "article_ids 不能为空"))
     if len(batch.article_ids) != len(set(batch.article_ids)):
@@ -81,6 +109,14 @@ def check_batch(snapshot: TaskEvaluationSnapshot, batch: Any, config: Evaluation
         if set(assessment.article_ids) != set(batch.article_ids):
             issues.append(_issue("assessment_articles_mismatch", "assessment article 集合与 Batch 不一致"))
         quality_by_id = {item.article_id: item for item in assessment.quality_assessments}
+        frozen_articles = (batch.input_payload or {}).get("batch", {}).get("articles", [])
+        frozen_spans = {str(item["article_id"]): item.get("evidence_spans", {}) for item in frozen_articles}
+        if frozen_spans:
+            for item in assessment.relevance_assessments:
+                _validate_span_references(item.evidence_span_ids, str(item.article_id), frozen_spans, issues)
+            for item in assessment.quality_assessments:
+                for criterion in item.criteria:
+                    _validate_span_references(criterion.evidence_span_ids, str(item.article_id), frozen_spans, issues)
         score_rows = batch.score_payload or []
         score_ids = []
         for row in score_rows:
@@ -106,6 +142,20 @@ def check_batch(snapshot: TaskEvaluationSnapshot, batch: Any, config: Evaluation
         rubric_contract_version=config.rubric_contract_version if study_type else None,
         rubric_sha256=rubric_sha256,
     )
+
+
+def _validate_span_references(span_ids: list[str], article_id: str, frozen_spans: dict[str, Any], issues: list[CheckIssue]) -> None:
+    if not span_ids:
+        return
+    if article_id not in frozen_spans:
+        issues.append(_issue("missing_frozen_spans", f"article {article_id} 缺少批次冻结 spans"))
+        return
+    try:
+        resolve_span_ids(frozen_spans[article_id], span_ids)
+        if any(not span_id.startswith(article_id + ":") for span_id in span_ids):
+            raise ValueError("span ID 所属文章不一致")
+    except (KeyError, ValueError) as exc:
+        issues.append(_issue("invalid_evidence_span", f"article {article_id}：{exc}"))
 
 
 def build_dry_run_report(snapshot: TaskEvaluationSnapshot, config: EvaluationConfig, max_llm_calls: int | None) -> DryRunReport:

@@ -66,7 +66,7 @@
 | `not_reported` | `-1` | 摘要没有该问题的证据 | 没有抽样来源时，抽样框问题为该级 | 摘要明确写出随机抽样却记为该级 |
 | `not_applicable` | `null` | 该问题对当前研究确实不适用 | 非 Meta 分析不评价 Meta 异质性 | 仅因摘要缺失而使用该级 |
 
-`not_reported` 的 `evidence_quote` 固定为“摘要未报告”；`unclear` 必须引用实际存在的不足证据；`favorable` 必须引用足以支持该单一命题的最短完整原句。所有状态都必须有 `reason` 和 `evidence_source`。
+`not_reported` 不提供证据 span，程序将 `evidence_quote` 固定为“摘要未报告”；`unclear` 必须引用实际存在的不足证据 span；`favorable` 必须引用支持该单一命题的 span。所有状态都必须有 `reason` 和 `evidence_source`。
 
 每个具体问题都要有四种状态的例子：`favorable` 的支持性正例、`unclear` 的不足性边界例、`not_reported` 的缺失信息反例，以及 `not_applicable` 的适用性正例和误用反例。目录表的“适用研究类型”定义 `not_applicable` 的边界；题目适用但摘要没写时必须使用 `not_reported`。
 

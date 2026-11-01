@@ -50,6 +50,7 @@ class BatchSnapshot(StrictModel):
     study_type: str
     status: str
     article_ids: list[UUID]
+    input_payload: dict[str, Any] | None = None
     assessment_payload: dict[str, Any] | None = None
     score_payload: list[dict[str, Any]] | None = None
     error_type: str | None = None

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import date
 from enum import StrEnum
-from typing import Annotated, ClassVar, Generic, Literal, TypeVar
+from typing import Any, Annotated, ClassVar, Generic, Literal, TypeVar
 from uuid import UUID
 
 from pydantic import (
@@ -18,7 +18,7 @@ from pydantic import (
 
 
 class _StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
 
 
 class StudyType(StrEnum):
@@ -158,7 +158,7 @@ class NarrativeReviewCriterionId(StrEnum):
 
 
 class QualityEvaluationJob(_StrictModel):
-    """LangGraph 分支中只携带 UUID 的质量评价任务。"""
+    """单个固定 Agent 的最小可调度工作单元。"""
 
     task_id: str = Field(min_length=1)
     group_id: str = Field(min_length=1)
@@ -179,6 +179,8 @@ class EvaluationArticle(_StrictModel):
     article_id: UUID
     title: str = Field(min_length=1)
     abstract: str | None = None
+    evidence_spans: dict[str, Any] = Field(default_factory=dict)
+    evidence_span_version: str | None = None
     abstract_available: bool | None = None
     doi: str | None = None
     pmid: str | None = None
@@ -197,18 +199,17 @@ class EvaluationArticle(_StrictModel):
 
 
 class HydratedArticleBatch(_StrictModel):
-    """准备序列化为用户消息的完整同类文章批次。"""
+    """准备送入大模型评估的完整批次上下文。"""
 
     job: QualityEvaluationJob
     user_query: str = Field(min_length=1)
     articles: list[EvaluationArticle] = Field(min_length=1, max_length=10)
 
     @model_validator(mode="after")
-    def validate_articles_match_job(self) -> "HydratedArticleBatch":
-        hydrated_ids = [article.article_id for article in self.articles]
-        if len(hydrated_ids) != len(set(hydrated_ids)):
-            raise ValueError("数据库返回的文章 UUID 不能重复")
-        if set(hydrated_ids) != set(self.job.article_ids):
+    def validate_exact_article_coverage(self) -> "HydratedArticleBatch":
+        expected_ids = set(self.job.article_ids)
+        actual_ids = {article.article_id for article in self.articles}
+        if len(self.articles) != len(actual_ids) or actual_ids != expected_ids:
             raise ValueError("数据库返回的文章 UUID 必须与任务完全一致")
         return self
 
@@ -217,22 +218,23 @@ class RelevanceAssessment(_StrictModel):
     article_id: UUID
     score: float = Field(ge=0.0, le=10.0)
     level: RelevanceLevel
-    reason: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=300)
     answerability_score: float = Field(ge=0.0, le=10.0)
-    answerability_reason: str = Field(min_length=1)
+    answerability_reason: str = Field(min_length=1, max_length=300)
     matched_dimensions: list[str] = Field(default_factory=list)
     evidence_gaps: list[str] = Field(default_factory=list)
+    evidence_span_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def validate_level_matches_score(self) -> "RelevanceAssessment":
-        expected = (
+    def validate_level_consistency(self) -> "RelevanceAssessment":
+        expected_level = (
             RelevanceLevel.HIGH
-            if self.score >= 8
+            if self.score >= 8.0
             else RelevanceLevel.PARTIAL
-            if self.score >= 4
+            if self.score >= 4.0
             else RelevanceLevel.LOW
         )
-        if self.level != expected:
+        if self.level != expected_level:
             raise ValueError("相关性等级与分数不一致")
         return self
 
@@ -243,10 +245,11 @@ CriterionIdT = TypeVar("CriterionIdT", bound=StrEnum)
 class CriterionAssessment(_StrictModel, Generic[CriterionIdT]):
     criterion_id: CriterionIdT
     status: CriterionStatus
-    score: float | None
-    evidence_quote: str = Field(min_length=1)
-    reason: str = Field(min_length=1)
-    evidence_source: EvidenceSource
+    score: float | None = None
+    evidence_quote: str = ""
+    reason: str = Field(min_length=1, max_length=200)
+    evidence_source: EvidenceSource = Field(default=EvidenceSource.ABSTRACT)
+    evidence_span_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_status_contract(self) -> "CriterionAssessment[CriterionIdT]":
@@ -256,7 +259,9 @@ class CriterionAssessment(_StrictModel, Generic[CriterionIdT]):
             CriterionStatus.NOT_REPORTED: -1.0,
             CriterionStatus.NOT_APPLICABLE: None,
         }
-        if self.score != expected_scores[self.status]:
+        if self.score is None:
+            self.score = expected_scores[self.status]
+        elif self.score != expected_scores[self.status]:
             raise ValueError("score 必须等于 status 对应的固定分值")
         if (
             self.status == CriterionStatus.NOT_REPORTED
@@ -274,9 +279,9 @@ class StudyQualityAssessmentBase(_StrictModel, Generic[CriterionIdT]):
     article_id: UUID
     study_type: StudyType
     criteria: list[CriterionAssessment[CriterionIdT]] = Field(min_length=1)
-    strengths: list[str] = Field(default_factory=list)
-    limitations: list[str] = Field(default_factory=list)
-    evidence_gaps: list[str] = Field(default_factory=list)
+    strengths: list[Annotated[str, Field(max_length=120)]] = Field(default_factory=list, max_length=5)
+    limitations: list[Annotated[str, Field(max_length=120)]] = Field(default_factory=list, max_length=5)
+    evidence_gaps: list[Annotated[str, Field(max_length=120)]] = Field(default_factory=list, max_length=5)
     confidence: float = Field(ge=0.0, le=1.0)
 
     criterion_enum: ClassVar[type[StrEnum]]
@@ -291,13 +296,13 @@ class StudyQualityAssessmentBase(_StrictModel, Generic[CriterionIdT]):
 
 
 class RCTQualityAssessment(StudyQualityAssessmentBase[RCTCriterionId]):
-    study_type: Literal[StudyType.RCT]
+    study_type: Literal[StudyType.RCT] = StudyType.RCT
     criteria: list[RCTCriterionAssessment] = Field(min_length=5, max_length=5)
     criterion_enum = RCTCriterionId
 
 
 class CohortQualityAssessment(StudyQualityAssessmentBase[CohortCriterionId]):
-    study_type: Literal[StudyType.COHORT]
+    study_type: Literal[StudyType.COHORT] = StudyType.COHORT
     criteria: list[CriterionAssessment[CohortCriterionId]] = Field(
         min_length=5,
         max_length=5,
@@ -306,7 +311,7 @@ class CohortQualityAssessment(StudyQualityAssessmentBase[CohortCriterionId]):
 
 
 class CaseControlQualityAssessment(StudyQualityAssessmentBase[CaseControlCriterionId]):
-    study_type: Literal[StudyType.CASE_CONTROL]
+    study_type: Literal[StudyType.CASE_CONTROL] = StudyType.CASE_CONTROL
     criteria: list[CriterionAssessment[CaseControlCriterionId]] = Field(
         min_length=5,
         max_length=5,
@@ -317,7 +322,9 @@ class CaseControlQualityAssessment(StudyQualityAssessmentBase[CaseControlCriteri
 class AnalyticalCrossSectionalQualityAssessment(
     StudyQualityAssessmentBase[AnalyticalCrossSectionalCriterionId]
 ):
-    study_type: Literal[StudyType.CROSS_SECTIONAL_ANALYTICAL]
+    study_type: Literal[StudyType.CROSS_SECTIONAL_ANALYTICAL] = (
+        StudyType.CROSS_SECTIONAL_ANALYTICAL
+    )
     criteria: list[CriterionAssessment[AnalyticalCrossSectionalCriterionId]] = Field(
         min_length=5,
         max_length=5,
@@ -328,7 +335,9 @@ class AnalyticalCrossSectionalQualityAssessment(
 class PrevalenceCrossSectionalQualityAssessment(
     StudyQualityAssessmentBase[PrevalenceCrossSectionalCriterionId]
 ):
-    study_type: Literal[StudyType.CROSS_SECTIONAL_PREVALENCE]
+    study_type: Literal[StudyType.CROSS_SECTIONAL_PREVALENCE] = (
+        StudyType.CROSS_SECTIONAL_PREVALENCE
+    )
     criteria: list[CriterionAssessment[PrevalenceCrossSectionalCriterionId]] = Field(
         min_length=5,
         max_length=5,
@@ -339,7 +348,7 @@ class PrevalenceCrossSectionalQualityAssessment(
 class SystematicReviewQualityAssessment(
     StudyQualityAssessmentBase[SystematicReviewCriterionId]
 ):
-    study_type: Literal[StudyType.SYSTEMATIC_REVIEW]
+    study_type: Literal[StudyType.SYSTEMATIC_REVIEW] = StudyType.SYSTEMATIC_REVIEW
     criteria: list[CriterionAssessment[SystematicReviewCriterionId]] = Field(
         min_length=5,
         max_length=5,
@@ -350,7 +359,7 @@ class SystematicReviewQualityAssessment(
 class MetaAnalysisQualityAssessment(
     StudyQualityAssessmentBase[MetaAnalysisCriterionId]
 ):
-    study_type: Literal[StudyType.META_ANALYSIS]
+    study_type: Literal[StudyType.META_ANALYSIS] = StudyType.META_ANALYSIS
     criteria: list[CriterionAssessment[MetaAnalysisCriterionId]] = Field(
         min_length=9,
         max_length=9,
@@ -361,7 +370,9 @@ class MetaAnalysisQualityAssessment(
 class QualitativeSystematicReviewQualityAssessment(
     StudyQualityAssessmentBase[QualitativeSystematicReviewCriterionId]
 ):
-    study_type: Literal[StudyType.QUALITATIVE_SYSTEMATIC_REVIEW]
+    study_type: Literal[StudyType.QUALITATIVE_SYSTEMATIC_REVIEW] = (
+        StudyType.QUALITATIVE_SYSTEMATIC_REVIEW
+    )
     criteria: list[CriterionAssessment[QualitativeSystematicReviewCriterionId]] = Field(
         min_length=5,
         max_length=5,
@@ -372,7 +383,7 @@ class QualitativeSystematicReviewQualityAssessment(
 class UmbrellaReviewQualityAssessment(
     StudyQualityAssessmentBase[UmbrellaReviewCriterionId]
 ):
-    study_type: Literal[StudyType.UMBRELLA_REVIEW]
+    study_type: Literal[StudyType.UMBRELLA_REVIEW] = StudyType.UMBRELLA_REVIEW
     criteria: list[CriterionAssessment[UmbrellaReviewCriterionId]] = Field(
         min_length=7,
         max_length=7,
@@ -383,7 +394,7 @@ class UmbrellaReviewQualityAssessment(
 class NarrativeReviewQualityAssessment(
     StudyQualityAssessmentBase[NarrativeReviewCriterionId]
 ):
-    study_type: Literal[StudyType.NARRATIVE_REVIEW]
+    study_type: Literal[StudyType.NARRATIVE_REVIEW] = StudyType.NARRATIVE_REVIEW
     criteria: list[CriterionAssessment[NarrativeReviewCriterionId]] = Field(
         min_length=4,
         max_length=4,
@@ -441,10 +452,10 @@ QUALITY_MODEL_BY_STUDY_TYPE: dict[
 class ArticleAssessmentBatch(_StrictModel):
     """单次同类批量调用返回的相关性和质量评价。"""
 
-    task_id: str = Field(min_length=1)
-    group_id: str = Field(min_length=1)
-    study_type: StudyType
-    article_ids: list[UUID] = Field(min_length=1, max_length=10)
+    task_id: str = Field(default="")
+    group_id: str = Field(default="")
+    study_type: StudyType = Field(default=StudyType.RCT)
+    article_ids: list[UUID] = Field(default_factory=list)
     relevance_assessments: list[RelevanceAssessment] = Field(
         min_length=1,
         max_length=10,
@@ -456,6 +467,11 @@ class ArticleAssessmentBatch(_StrictModel):
 
     @model_validator(mode="after")
     def validate_batch_alignment(self) -> "ArticleAssessmentBatch":
+        if not self.article_ids:
+            self.article_ids = list(
+                dict.fromkeys(item.article_id for item in self.relevance_assessments)
+            )
+
         expected_ids = set(self.article_ids)
         if len(expected_ids) != len(self.article_ids):
             raise ValueError("article_ids 不能重复")
@@ -496,6 +512,7 @@ def article_assessment_model_for(
     batch_model = create_model(
         f"{quality_model.__name__}Batch",
         __base__=ArticleAssessmentBatch,
+        study_type=(StudyType, Field(default=study_type)),
         quality_assessments=(
             list[quality_model],  # type: ignore[valid-type]
             Field(min_length=1, max_length=10),
@@ -509,7 +526,10 @@ class CoverageAssessment(_StrictModel):
     concept: str = Field(min_length=1)
     status: CoverageStatus
     evidence_article_ids: list[UUID] = Field(default_factory=list)
-    reason: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=300)
+    checked_article_ids: list[UUID] = Field(default_factory=list)
+    evidence_span_ids: list[str] = Field(default_factory=list)
+    evidence_quotes: dict[UUID, list[str]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_evidence_ids(self) -> "CoverageAssessment":
@@ -550,7 +570,11 @@ class QueryCoverage(_StrictModel):
 class JointQueryCoverage(_StrictModel):
     status: CoverageStatus
     evidence_article_ids: list[UUID] = Field(default_factory=list)
-    reason: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=300)
+    evidence_span_ids: list[str] = Field(default_factory=list)
+    checked_article_ids: list[UUID] = Field(default_factory=list)
+    evidence_by_article: dict[UUID, list[str]] = Field(default_factory=dict)
+    evidence_quotes_by_article: dict[UUID, list[str]] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_evidence_ids(self) -> "JointQueryCoverage":
@@ -564,7 +588,9 @@ class JointQueryCoverage(_StrictModel):
 class RedundancyOrConflict(_StrictModel):
     status: Literal[CoverageStatus.CONFLICTING, "redundant"]
     article_ids: list[UUID] = Field(min_length=2)
-    reason: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=300)
+    evidence_span_ids_by_article: dict[UUID, list[str]] = Field(default_factory=dict)
+    evidence_quotes_by_article: dict[UUID, list[str]] = Field(default_factory=dict)
 
     @field_validator("article_ids")
     @classmethod
@@ -576,24 +602,42 @@ class RedundancyOrConflict(_StrictModel):
 
 class ArticleContribution(_StrictModel):
     article_id: UUID
-    role: ContributionRole
+    role: ContributionRole | None = None
+    contribution_level: Literal["high", "medium", "low", "none"] | None = None
     covered_concepts: list[str] = Field(default_factory=list)
-    coverage_contribution_score: float = Field(ge=0.0, le=10.0)
-    reason: str = Field(min_length=1)
+    coverage_contribution_score: float = Field(default=0.0, ge=0.0, le=10.0)
+    reason: str = Field(min_length=1, max_length=300)
+    evidence_span_ids: list[str] = Field(default_factory=list)
+    evidence_source: EvidenceSource = Field(default=EvidenceSource.ABSTRACT)
+    overlap_article_ids: list[UUID] = Field(default_factory=list)
+    evidence_quote: str = ""
+
+    @model_validator(mode="after")
+    def validate_contribution_level(self) -> "ArticleContribution":
+        if self.contribution_level is not None:
+            expected = {"high": 3.0, "medium": 2.0, "low": 1.0, "none": 0.0}[self.contribution_level]
+            self.coverage_contribution_score = expected
+            if self.contribution_level == "none" and not self.overlap_article_ids:
+                raise ValueError("none 贡献必须提供 overlap_article_ids")
+        return self
 
 
 class PortfolioEvaluation(_StrictModel):
-    task_id: str = Field(min_length=1)
-    candidate_article_ids: list[UUID] = Field(min_length=1)
+    task_id: str = Field(default="")
+    candidate_article_ids: list[UUID] = Field(default_factory=list)
     query_coverage: QueryCoverage
     joint_query_coverage: JointQueryCoverage
-    coverage_gaps: list[str] = Field(default_factory=list)
+    coverage_gaps: list[Annotated[str, Field(max_length=120)]] = Field(default_factory=list, max_length=10)
     redundancy_and_conflicts: list[RedundancyOrConflict] = Field(default_factory=list)
     article_contributions: list[ArticleContribution] = Field(min_length=1)
-    recommendation: str = Field(min_length=1)
+    recommendation: str = Field(default="", max_length=600)
 
     @model_validator(mode="after")
     def validate_candidate_alignment(self) -> "PortfolioEvaluation":
+        if not self.candidate_article_ids:
+            self.candidate_article_ids = [
+                item.article_id for item in self.article_contributions
+            ]
         expected_ids = self.candidate_article_ids
         contribution_ids = [item.article_id for item in self.article_contributions]
         if (
@@ -615,8 +659,24 @@ class PortfolioEvaluation(_StrictModel):
             for article_id in item.evidence_article_ids
         )
         referenced_ids.update(self.joint_query_coverage.evidence_article_ids)
+        referenced_ids.update(self.joint_query_coverage.checked_article_ids)
         for item in self.redundancy_and_conflicts:
             referenced_ids.update(item.article_ids)
         if not referenced_ids.issubset(set(expected_ids)):
             raise ValueError("集合评价不得引用候选集之外的文章 UUID")
+        expected_scores = {"high": 3.0, "medium": 2.0, "low": 1.0, "none": 0.0}
+        for contribution in self.article_contributions:
+            if contribution.contribution_level is not None:
+                contribution.coverage_contribution_score = expected_scores[contribution.contribution_level]
+            if not set(contribution.overlap_article_ids).issubset(set(expected_ids)):
+                raise ValueError("overlap_article_ids 不得引用候选集之外的文章")
+        if self.joint_query_coverage.status == CoverageStatus.ABSENT and not self.joint_query_coverage.checked_article_ids:
+            raise ValueError("absent joint coverage 必须提供 checked_article_ids")
+        if not set(self.joint_query_coverage.checked_article_ids).issubset(set(expected_ids)):
+            raise ValueError("joint checked_article_ids 不得引用候选集之外的文章")
+        self.coverage_gaps = [
+            f"{item.concept}:{item.status.value}"
+            for item in (*self.query_coverage.keyword_coverage, *self.query_coverage.constraint_coverage)
+            if item.status in {CoverageStatus.ABSENT, CoverageStatus.PARTIAL, CoverageStatus.INDIRECT, CoverageStatus.CONFLICTING}
+        ]
         return self

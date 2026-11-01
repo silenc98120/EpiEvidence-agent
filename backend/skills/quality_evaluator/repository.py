@@ -5,7 +5,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 
-from backend.app.db import ArticleORM, SearchRunORM, SourceRecordORM
+from backend.app.db import ArticleORM
 from backend.skills.quality_evaluator.schema import HydratedArticleBatch, QualityEvaluationJob, EvaluationArticle
 
 
@@ -19,27 +19,7 @@ class ArticleRepository:
         *,
         user_query: str,
     ) -> HydratedArticleBatch:
-        try:
-            task_id = UUID(job.task_id)
-        except ValueError as exc:
-            raise ValueError("质量评估任务的 task_id 必须是 PostgreSQL UUID") from exc
-
-        statement = (
-            select(ArticleORM)
-            .join(
-                SourceRecordORM,
-                SourceRecordORM.article_id == ArticleORM.article_id,
-            )
-            .join(
-                SearchRunORM,
-                SearchRunORM.search_run_id == SourceRecordORM.search_run_id,
-            )
-            .where(
-                ArticleORM.article_id.in_(job.article_ids),
-                SearchRunORM.task_id == task_id,
-            )
-            .distinct()
-        )
+        statement = select(ArticleORM).where(ArticleORM.article_id.in_(job.article_ids))
         async with self._session_factory() as session:
             rows = list((await session.scalars(statement)).all())
 
@@ -68,6 +48,8 @@ class ArticleRepository:
             article_id=row.article_id,
             title=row.title,
             abstract=row.abstract,
+            evidence_spans=row.evidence_spans or {},
+            evidence_span_version=row.evidence_span_version,
             abstract_available=row.abstract_available,
             doi=row.doi,
             pmid=row.pmid,

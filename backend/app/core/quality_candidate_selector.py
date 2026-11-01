@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Protocol
 
+from loguru import logger
 from openai import AsyncOpenAI
 
 
@@ -38,6 +39,7 @@ class CandidateArticle:
     publication_date: date | None = None
     publication_year: int | None = None
     study_design: str | None = None
+    keywords: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -244,26 +246,99 @@ class QualityCandidateSelector:
         self._abstract_character_limit = abstract_character_limit
         self._embedding_store = embedding_store
 
+    def coarse_filter(
+        self,
+        *,
+        profile: ResearchProfile,
+        articles: Sequence[CandidateArticle],
+    ) -> Sequence[CandidateArticle]:
+        """根据文献数量规模进行快速粗筛与截断：
+        1. <= 200 篇：直接全量进入 embedding；
+        2. > 200 篇：先做快速粗筛（基于关键词与时效性匹配）；
+        3. > 400 篇：做完初筛之后，截断前 200 篇文献，再进入 embedding。
+        """
+        total = len(articles)
+        if total <= 200:
+            return articles
+
+        ranked: list[tuple[bool, bool, float, int, CandidateArticle]] = []
+        for article in articles:
+            core_matched, keyword_score, _recency, coarse_score, year = _compute_coarse_score(
+                profile=profile,
+                article=article,
+                reference_date=self._reference_date,
+            )
+            has_keyword_match = keyword_score > 0
+            ranked.append((core_matched, has_keyword_match, coarse_score, year, article))
+
+        # 排序优先级：核心干预命中 > 命中关键词 > 粗排综合分高 > 发表年份新 > 原文献ID
+        ranked.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2],
+                item[3],
+                item[4].article_id,
+            ),
+            reverse=True,
+        )
+
+        if total > 400:
+            filtered = [item[4] for item in ranked[:200]]
+            logger.bind(
+                component="quality_selector",
+                total_articles=total,
+                selected_articles=len(filtered),
+            ).info("文献数量超过 400 篇，完成快速粗筛并截断前 200 篇进入 Embedding")
+            return filtered
+
+        # 200 < total <= 400: 粗排后剔除毫无相关性的文献（未命中核心干预且未命中任一关键词）
+        filtered = [
+            item[4]
+            for item in ranked
+            if item[0] and item[1]
+        ]
+        # 若核心干预与关键词双重过滤过于严格导致候选过少，退回只要求命中任一概念关键词
+        if len(filtered) < min(50, total):
+            filtered = [
+                item[4]
+                for item in ranked
+                if item[1]
+            ]
+        # 若依然过少，保底保留按综合粗排分排序靠前的候选
+        if len(filtered) < min(50, total):
+            filtered = [item[4] for item in ranked[:min(200, total)]]
+
+        logger.bind(
+            component="quality_selector",
+            total_articles=total,
+            selected_articles=len(filtered),
+        ).info("文献数量超过 200 篇，完成快速粗筛并保留高相关候选进入 Embedding")
+        return filtered
+
     async def rank(
         self,
         *,
         profile: ResearchProfile,
         articles: Sequence[CandidateArticle],
     ) -> list[CandidateScore]:
-        """计算所有文章分数；不会在此处删除任何候选。"""
+        """计算文章分数；按规模策略自动执行粗排初筛后进入向量计算。"""
 
         if not articles:
             return []
+
+        articles_to_embed = self.coarse_filter(profile=profile, articles=articles)
+
         query_vectors = await self._embedding_client.embed([profile.query_text])
         if len(query_vectors) != 1:
             raise RuntimeError("embedding 服务没有返回唯一 query 向量")
         query_vector = query_vectors[0]
-        article_vectors = await self._article_vectors(articles)
+        article_vectors = await self._article_vectors(articles_to_embed)
         cosine_values = _cosine_similarities(query_vector, article_vectors)
 
         scores = [
             self._score_article(profile, article, cosine)
-            for article, cosine in zip(articles, cosine_values, strict=True)
+            for article, cosine in zip(articles_to_embed, cosine_values, strict=True)
         ]
         return sorted(
             scores,
@@ -330,8 +405,13 @@ class QualityCandidateSelector:
         )
 
     def _article_embedding_text(self, article: CandidateArticle) -> str:
+        parts = [f"Title: {article.title.strip()}"]
+        if article.keywords:
+            parts.append(f"Keywords: {', '.join(article.keywords)}")
         abstract = (article.abstract or "").strip()[: self._abstract_character_limit]
-        return f"Title: {article.title.strip()}\n\nAbstract: {abstract}"
+        if abstract:
+            parts.append(f"Abstract: {abstract}")
+        return "\n\n".join(parts)
 
     async def _article_vectors(self, articles: Sequence[CandidateArticle]) -> list[list[float]]:
         texts = [self._article_embedding_text(article) for article in articles]
@@ -344,7 +424,7 @@ class QualityCandidateSelector:
                 article_id=article.article_id,
                 model_name=model_name,
                 model_revision=model_revision,
-                representation_version="article-title-abstract-v1",
+                representation_version="article-title-keywords-abstract-v2",
                 content_hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
             )
             for article, text in zip(articles, texts, strict=True)
@@ -462,6 +542,37 @@ def _recency_score(
         return 50.0
     age_years = max(0.0, (reference_date - effective_date).days / 365.25)
     return 20.0 + 80.0 * math.exp(-age_years / 7.0)
+
+
+def _compute_coarse_score(
+    profile: ResearchProfile,
+    article: CandidateArticle,
+    reference_date: date,
+) -> tuple[bool, float, float, float, int]:
+    """快速计算文章的粗排指标（纯文本匹配，不调用任何模型）。"""
+    title = _normalize_match_text(article.title)
+    abstract = _normalize_match_text(article.abstract or "")
+    concept_scores = {
+        concept: _concept_match_score(concept, title=title, abstract=abstract)
+        for concept in profile.concepts
+    }
+    keyword_score = _weighted_keyword_score(concept_scores)
+    recency_score = _recency_score(
+        publication_date=article.publication_date,
+        publication_year=article.publication_year,
+        reference_date=reference_date,
+    )
+    core_concepts = [
+        concept
+        for concept in profile.concepts
+        if concept.kind in _CORE_INTERVENTION_KINDS
+    ]
+    core_matched = not core_concepts or all(
+        concept_scores[concept] > 0 for concept in core_concepts
+    )
+    coarse_score = 0.85 * keyword_score + 0.15 * recency_score
+    year = article.publication_year or 0
+    return core_matched, keyword_score, recency_score, coarse_score, year
 
 
 def _selection_reasons(

@@ -43,7 +43,7 @@ def _required_env(name: str) -> str:
     return value
 
 
-def create_chat_model() -> BaseChatModel:
+def create_chat_model(*, max_retries: int = 1) -> BaseChatModel:
     """根据当前环境配置创建一个聊天模型客户端。"""
     provider = _required_env("LLM_PROVIDER").lower()
     model = _required_env("LLM_MODEL")
@@ -63,8 +63,8 @@ def create_chat_model() -> BaseChatModel:
             "model": model,
             "api_key": api_key,
             "temperature": temperature,
-            "timeout": 120,
-            "max_retries": 3,
+            "timeout": float(os.getenv("LLM_TIMEOUT_SECONDS", "180")),
+            "max_retries": max_retries,
         }
         if base_url:
             kwargs["base_url"] = base_url
@@ -72,6 +72,44 @@ def create_chat_model() -> BaseChatModel:
         return ChatOpenAI(**kwargs)
 
     raise ValueError(f"不支持的 LLM_PROVIDER: {provider}")
+
+
+def create_eval_chat_model() -> BaseChatModel:
+    """根据 EVAL_LLM 环境变量创建评测专用模型，未单独配置时回退到主 LLM。"""
+    eval_provider = os.getenv("EVAL_LLM_PROVIDER", "").strip().lower()
+    if not eval_provider:
+        return create_chat_model(max_retries=0)
+
+    model = os.getenv("EVAL_LLM_MODEL") or _required_env("LLM_MODEL")
+    base_url = normalize_openai_base_url(
+        os.getenv("EVAL_LLM_BASE_URL") or os.getenv("LLM_BASE_URL")
+    )
+    temperature = float(os.getenv("EVAL_LLM_TEMPERATURE", "0"))
+    api_key = os.getenv("EVAL_LLM_API_KEY") or os.getenv("LLM_API_KEY")
+
+    if eval_provider == "ollama":
+        return ChatOllama(
+            model=model,
+            base_url=base_url or "http://localhost:11434",
+            temperature=temperature,
+        )
+
+    if eval_provider in OPENAI_COMPATIBLE_PROVIDERS:
+        kwargs = {
+            "model": model,
+            "api_key": api_key,
+            "temperature": temperature,
+            "timeout": float(
+                os.getenv("EVAL_LLM_TIMEOUT_SECONDS") or "180"
+            ),
+            "max_retries": 0,  # BatchExecutor 统一管理重试预算。
+        }
+        if base_url:
+            kwargs["base_url"] = base_url
+
+        return ChatOpenAI(**kwargs)
+
+    raise ValueError(f"不支持的 EVAL_LLM_PROVIDER: {eval_provider}")
 
 
 def create_embedding_client() -> OpenAICompatibleEmbeddingClient | LocalBGEM3EmbeddingClient:

@@ -118,14 +118,20 @@ class IntentRecognizer:
         self._model = model
         self._system_prompt_template = system_prompt_template
         self._callback_handler = callback_handler
-        self._structured_model = model.with_structured_output(
-            IntentRecognitionResult,
-            include_raw=True,
-            # 智谱兼容端点可能把 JSON 包在 Markdown 围栏中。json_mode 交由
-            # LangChain 的 JSON 解析器清理围栏，再执行 Pydantic 契约校验；
-            # 不使用 OpenAI SDK 的原生 JSON Schema 响应解析。
-            method="json_mode",
-        )
+        # 优先使用 json_mode，兼容 DeepSeek / 百炼等开启 Thinking 模式的端点
+        # （Thinking 模式下服务端会拒绝强制 tool_choice 参数）；回退支持 function_calling。
+        try:
+            self._structured_model = model.with_structured_output(
+                IntentRecognitionResult,
+                method="json_mode",
+                include_raw=True,
+            )
+        except (TypeError, ValueError):
+            self._structured_model = model.with_structured_output(
+                IntentRecognitionResult,
+                method="function_calling",
+                include_raw=True,
+            )
         self._system_prompt = self.build_intent_system_prompt()
 
     async def recognize(self, user_query: str) -> IntentRecognitionResult:
@@ -177,9 +183,11 @@ class IntentRecognizer:
                 event="structured_output_invalid",
                 latency_ms=round(latency_ms, 1),
                 error_type=type(parsing_error).__name__ if parsing_error else None,
-            ).warning("意图识别结构化输出校验失败")
+                error_detail=str(parsing_error),
+                raw_content=getattr(raw_message, "content", None),
+            ).warning("意图识别结构化输出校验失败: {}", parsing_error)
 
-            raise ValueError("LLM 返回内容未能通过 IntentRecognitionResult 校验。")
+            raise ValueError(f"LLM 返回内容未能通过 IntentRecognitionResult 校验: {parsing_error}")
 
         usage = (
                 getattr(raw_message, "usage_metadata", None)

@@ -14,7 +14,7 @@
 - 将异构题录统一为同一数据契约，并根据 DOI、PMID、PMCID 或题名组合进行保守去重。
 - 将检索事实写入 PostgreSQL，仅在 LangGraph State 和 Redis 中传递任务决策与文章 ID。
 - 在进入 LLM 评价前，综合关键词、embedding 相似度和时效性筛选候选文献。
-- 按研究设计分批执行 Quality Evaluator：类型化 rubric、LLM 初评、verifier 核查、程序重算与集合级排序。
+- 按研究设计选择 rubric，每篇一次质量评价；共享请求并发、严格校验、程序评分与集合覆盖排序。
 - 由 Evidence Summarizer 自主选择值得推荐的文献数量，生成普通中文聊天回复。
 - FastAPI 提供任务生命周期接口，并以 AG-UI 风格事件通过 SSE 推送运行阶段和最终文本。
 - 使用 PostgreSQL LangGraph checkpoint 支持稳定的 `thread_id` 与任务恢复；使用 Langfuse 记录主任务、节点和模型调用 traces。
@@ -32,7 +32,8 @@ POST /api/tasks
           → 标准化、去重、PostgreSQL 持久化（fan-in）
           → 候选综合排序
           → 按研究设计分组
-          → Celery 分批质量初评与核查
+          → 单篇 Send → 专精质量评价（共享并发 5）
+          → 结果对账 → 集合覆盖评价 → 排序
           → Evidence Summarizer
           → 中文回复 + SSE 完成事件
 ```
@@ -57,7 +58,7 @@ POST /api/tasks
 | API | FastAPI；任务创建、查询、取消、恢复及 SSE 事件流 |
 | Agent 编排 | LangGraph；状态管理、节点路由、fan-out/fan-in 和 checkpoint |
 | LLM | LangChain；OpenAI-compatible API 或 Ollama，Pydantic 结构化输出 |
-| 任务执行 | Celery + Redis broker；按研究设计派发质量评价批次 |
+| 任务执行 | LangGraph Send 子图；单篇调度，共享模型请求名额，PostgreSQL 保存恢复输入与结果 |
 | 事实存储 | PostgreSQL + SQLAlchemy 2.0 + Alembic；任务、检索、文献、质量结果 |
 | 工作缓存 | Redis；短期状态、小型决策结果和文章 ID 索引 |
 | 术语索引 | SQLite；本地 MeSH preferred term 与 entry terms 查询 |
@@ -76,7 +77,6 @@ backend/
 │  ├─ observability/              Langfuse 运行时包装
 │  ├─ runtime/                    任务协调和 PostgreSQL checkpoint
 │  ├─ tools/article_search/       各文献数据源检索与 OA 资源工具
-│  └─ workers/                    Celery 配置、任务契约与质量评价 Worker
 ├─ alembic/                       数据库迁移
 └─ skills/quality_evaluator/      rubric、Schema、Prompt、评分与评价流程
 scripts/                          MeSH 建库、真实任务 smoke run 和候选排序脚本
@@ -114,7 +114,6 @@ EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1
 DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/epi_evidence_db
 CHECKPOINTS_DATABASE_URL=postgresql://user:password@localhost:5432/epi_evidence_checkpoints
 REDIS_URL=redis://localhost:6379/0
-CELERY_BROKER_URL=redis://localhost:6379/0
 ```
 
 > [!NOTE]
@@ -152,15 +151,9 @@ uv run alembic upgrade head
 
 应用不会自动创建业务表。
 
-### 4. 启动 Worker 与 API
+### 4. 启动 API
 
-启动 Redis 后，在一个终端启动质量评价 Worker：
-
-```powershell
-uv run celery -A backend.app.workers.celery_app:celery_app worker -l INFO -Q default,quality-rct,quality-cohort,quality-case-control,quality-cross-sectional-analytical,quality-cross-sectional-prevalence,quality-systematic-review,quality-meta-analysis,quality-qualitative-systematic-review,quality-umbrella-review,quality-narrative-review
-```
-
-在另一个终端启动 API：
+启动 Redis 工作缓存后，直接启动 API。质量评估通过 LangGraph 子图执行，不需要启动 Celery Worker 或额外守护进程。
 
 ```powershell
 uv run uvicorn backend.app.api.main:app --reload
@@ -197,7 +190,7 @@ uv run python scripts/run_agent_test_set.py --timeout 180
 uv run python scripts/verify_langfuse.py
 ```
 
-测试套件默认不会调用真实 LLM 或外部文献服务；`run_agent_test_set.py` 是真实 smoke run，其结果取决于本地 PostgreSQL、Redis、Worker、模型配置和外部 API 可用性。
+测试套件默认不会调用真实 LLM 或外部文献服务；`run_agent_test_set.py` 是真实 smoke run，其结果取决于本地 PostgreSQL、Redis 缓存、模型配置和外部 API 可用性。
 
 ## 当前边界
 
@@ -209,3 +202,28 @@ uv run python scripts/verify_langfuse.py
 - `main.py` 仍是脚手架入口；实际 API 入口为 `backend.app.api.main:app`。
 
 项目当前重点是稳定“自然语言研究问题 → 多源摘要检索 → 可追踪的质量初筛 → 中文文献推荐”这一后端闭环。
+
+## 质量评估并发与恢复
+
+```dotenv
+QUALITY_BATCH_SIZE=1
+QUALITY_EXPERT_CONCURRENCY=5
+```
+
+一个 Job 固定只评一篇文章。并发值限制同一应用图中、所有研究任务合计的在途质量评估模型请求；同类型文章也能用满 5 个名额。等待请求按研究类型轮转，其他类型处理结束后名额立即复用。此设置适用于单 API 进程；多个 API 进程分别拥有自己的上限。
+
+每次模型调用都携带固定 skill prompt、当前类型完整 JSON Schema、研究问题和本篇摘要。prompt 在本地缓存；后续请求不依赖模型记住前一篇内容。初次请求和重试共用最多 2 次尝试、每个 Job 240 秒总 deadline；退避时释放名额，SDK 不再叠加重试。
+
+计划分发前将输入快照写入 PostgreSQL。领取成功才能评估，完成写入核对 attempt token 与有效租约。`POST /api/tasks/{task_id}/resume` 沿原 checkpoint 恢复，已完成文章直接复用，过期租约才允许重新领取。进程重启后也可按原任务 ID 查询和恢复。
+
+`GET /api/tasks/{task_id}` 的 `quality_progress` 和 SSE `CUSTOM` 事件（`name=quality_progress`）包含 planned、pending、processing、completed、failed、cancelled 计数。每篇记录 hydrate、等待名额、模型、校验、计分、持久化与重试指标；最终结果的 `quality_evaluation_failures` 显式列出漏评与集合降级。
+
+阈值筛选后先执行集合覆盖评价，正常按贡献分、综合分与日期排序，再限制候选窗口。集合评价失败时按单篇综合分排序，贡献分为 `null`，没有完成文章评价的文献不会获得默认分数。
+
+可复用本地 RCT 摘要进行真实接口测量（会调用已配置模型）：
+
+```powershell
+.\.venv\Scripts\python.exe scripts/benchmark_quality_evaluation.py --limit 5 --concurrency 5
+```
+
+报告写入 `artifacts/quality-benchmarks/`。脚本保留本次独立测试任务的输入与批次记录，便于检查耗时及复用结果。

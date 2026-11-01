@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ class QualityPromptLoader:
     def __init__(self, prompt_dir: Path | None = None) -> None:
         self.prompt_dir = prompt_dir or Path(__file__).with_name("prompts")
 
+    @lru_cache(maxsize=10)
     def article_evaluation_prompt(self, study_type: StudyType) -> str:
         rubric = get_rubric(study_type)
         return self._render(
@@ -29,17 +31,12 @@ class QualityPromptLoader:
             {
                 "__STUDY_DOMAIN__": rubric.domain,
                 "__RUBRIC_RULES__": rubric.rules,
-                "__OUTPUT_SCHEMA__": self._schema_json(
-                    article_assessment_model_for(study_type)
-                ),
             },
         )
 
+    @lru_cache(maxsize=1)
     def portfolio_prompt(self) -> str:
-        return self._render(
-            "portfolio_evaluation_prompt.md",
-            {"__OUTPUT_SCHEMA__": self._schema_json(PortfolioEvaluation)},
-        )
+        return self._render("portfolio_evaluation_prompt.md", {})
 
     def _render(self, filename: str, replacements: dict[str, str]) -> str:
         template = (self.prompt_dir / filename).read_text(encoding="utf-8")

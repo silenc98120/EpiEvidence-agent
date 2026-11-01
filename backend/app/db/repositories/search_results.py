@@ -14,11 +14,12 @@ from datetime import date, datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from loguru import logger
 
 from backend.app.core.search_results_normalizer import EvidenceRecord
+from backend.app.core.evidence_spans import SEGMENTER_VERSION, build_evidence_spans
 
 from backend.app.db.models import ArticleORM, FullTextResourceORM, SearchRunORM, SourceRecordORM, TaskORM
 
@@ -172,7 +173,12 @@ class SearchResultsRepository:
                         )
                     source_row.article_id = article.article_id
                     source_row.normalization_status = "success"
-                    source_row.normalized_at = record.retrieved_at
+                    effective_normalized_at = record.retrieved_at or source_row.retrieved_at
+                    source_row.normalized_at = (
+                        max(source_row.retrieved_at, effective_normalized_at)
+                        if source_row.retrieved_at and effective_normalized_at
+                        else (effective_normalized_at or source_row.retrieved_at)
+                    )
                     source_row_by_key[source_key] = source_row
 
                 await session.flush()
@@ -228,14 +234,17 @@ class SearchResultsRepository:
     ) -> ArticleORM:
         article = await self._find_article(session, record)
         if article is None:
+            article_id = uuid4()
             article = ArticleORM(
-                article_id=uuid4(),
+                article_id=article_id,
                 doi=_clean(record.doi),
                 pmid=_clean(record.pmid),
                 pmcid=_clean(record.pmcid),
                 title=record.title,
                 normalized_title=record.normalized_title,
                 abstract=record.abstract,
+                evidence_spans=build_evidence_spans(article_id, record.title, record.abstract),
+                evidence_span_version=SEGMENTER_VERSION,
                 first_author=record.first_author,
                 authors=[item.model_dump(mode="json") for item in record.authors],
                 journal_title=record.journal_title,
@@ -255,6 +264,8 @@ class SearchResultsRepository:
             return article
 
         _fill_missing_article_fields(article, record)
+        article.evidence_spans = build_evidence_spans(article.article_id, article.title, article.abstract)
+        article.evidence_span_version = SEGMENTER_VERSION
         return article
 
     async def _find_article(
@@ -263,24 +274,28 @@ class SearchResultsRepository:
         record: EvidenceRecord,
     ) -> ArticleORM | None:
         conditions = []
-        if record.doi:
-            conditions.append(func.lower(func.btrim(ArticleORM.doi)) == record.doi.strip().casefold())
-        if record.pmid:
-            conditions.append(ArticleORM.pmid == record.pmid.strip())
-        if record.pmcid:
-            conditions.append(func.upper(func.btrim(ArticleORM.pmcid)) == record.pmcid.strip().upper())
+        clean_doi = _clean(record.doi)
+        clean_pmid = _clean(record.pmid)
+        clean_pmcid = _clean(record.pmcid)
+        if clean_doi:
+            conditions.append(func.lower(func.btrim(ArticleORM.doi)) == clean_doi.casefold())
+        if clean_pmid:
+            conditions.append(ArticleORM.pmid == clean_pmid)
+        if clean_pmcid:
+            conditions.append(func.upper(func.btrim(ArticleORM.pmcid)) == clean_pmcid.upper())
         if conditions:
-            row = await session.scalar(select(ArticleORM).where(conditions[0]))
+            row = await session.scalar(select(ArticleORM).where(or_(*conditions)).limit(1))
             if row is not None:
                 return row
-        if record.publication_year is not None and record.first_author:
+        clean_first_author = _clean(record.first_author)
+        if record.publication_year is not None and clean_first_author:
             return await session.scalar(
                 select(ArticleORM).where(
                     ArticleORM.normalized_title == record.normalized_title,
                     ArticleORM.publication_year == record.publication_year,
                     func.lower(func.btrim(ArticleORM.first_author))
-                    == record.first_author.strip().casefold(),
-                )
+                    == clean_first_author.casefold(),
+                ).limit(1)
             )
         return None
 
@@ -312,6 +327,18 @@ class SearchResultsRepository:
         if not resources:
             return
         preferred = _preferred_resource(resources)
+        if preferred is not None:
+            rows = await session.scalars(
+                select(FullTextResourceORM).where(
+                    FullTextResourceORM.article_id == article_id,
+                    FullTextResourceORM.is_preferred.is_(True),
+                )
+            )
+            for row in rows:
+                if row.resource_url != preferred.url:
+                    row.is_preferred = False
+            # 先释放唯一索引中的旧首选，再允许后续查询自动 flush 新首选。
+            await session.flush()
         for resource in resources:
             existing = await session.scalar(
                 select(FullTextResourceORM).where(
@@ -350,20 +377,6 @@ class SearchResultsRepository:
                 if is_preferred:
                     existing.is_preferred = True
 
-        if preferred is not None:
-            rows = list(
-                (
-                    await session.scalars(
-                        select(FullTextResourceORM).where(
-                            FullTextResourceORM.article_id == article_id
-                        )
-                    )
-                ).all()
-            )
-            selected_url = preferred.url
-            for row in rows:
-                if row.resource_url != selected_url:
-                    row.is_preferred = False
 
 
 def _provider_records(provider_result: Any) -> list[Any]:
@@ -426,9 +439,9 @@ def _source_key(record: EvidenceRecord) -> tuple[str, str]:
 
 def _fill_missing_article_fields(article: ArticleORM, record: EvidenceRecord) -> None:
     fields = {
-        "doi": record.doi,
-        "pmid": record.pmid,
-        "pmcid": record.pmcid,
+        "doi": _clean(record.doi),
+        "pmid": _clean(record.pmid),
+        "pmcid": _clean(record.pmcid),
         "abstract": record.abstract,
         "first_author": record.first_author,
         "journal_title": record.journal_title,
